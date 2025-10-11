@@ -4,7 +4,7 @@ import json, os
 
 app = Flask(__name__)
 
-# 🔑 Chaves da Binance (configuradas no Render Environment)
+# 🔑 Chaves da Binance (Render Environment)
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 
@@ -17,7 +17,7 @@ def webhook():
         action = data.get('action')
         print(f"🚨 ALERTA RECEBIDO: {action}")
 
-        # 📊 Consulta saldo
+        # 💰 Consulta saldo
         balance = client.balance()
         usdt_balance = next(
             (float(b['balance']) for b in balance if b['asset'] == 'USDT'),
@@ -28,53 +28,49 @@ def webhook():
         if usdt_balance <= 5:
             return jsonify({"status": "❌ Saldo insuficiente"}), 400
 
-        # ⚙️ Configurações do trade
         symbol = "BTCUSDT"
         leverage = 1
         margin_type = "ISOLATED"
 
-        # 🧭 Define margem isolada (só altera se necessário)
+        # 🔧 Define margem isolada e alavancagem
         try:
             client.change_margin_type(symbol=symbol, marginType=margin_type)
             print("✅ Modo de margem definido como ISOLADO")
         except Exception as e:
             if "No need to change margin type" in str(e):
-                print("ℹ️ Margem já está configurada como ISOLADA.")
+                print("ℹ️ Margem já está ISOLADA.")
             else:
-                print("⚠️ Erro ao definir margem:", e)
+                print("⚠️ Erro ao mudar margem:", e)
 
-        # 📈 Define alavancagem
         client.change_leverage(symbol=symbol, leverage=leverage)
-        print(f"⚙️ Alavancagem ajustada para {leverage}x")
+        print(f"⚙️ Alavancagem definida: {leverage}x")
 
-        # 💹 Preço atual BTC
-        ticker = client.ticker_price(symbol=symbol)
-        price = float(ticker['price'])
+        # 📈 Preço atual
+        price = float(client.ticker_price(symbol=symbol)['price'])
         print(f"💹 Preço atual BTCUSDT: {price}")
 
-        # 📦 Quantidade calculada (99% do saldo, com limites automáticos)
-        qty = round((usdt_balance * 0.99) / price, 4)
+        # 📦 Calcula quantidade — 99% do saldo / preço (3 casas decimais)
+        qty = (usdt_balance * 0.99) / price
+        qty = round(qty, 3)
 
-        # Respeita os limites mínimos e máximos da Binance
+        # Garante mínimo aceito pela Binance
         if qty < 0.001:
-            qty = 0.001  # mínimo aceito
-        if qty > 0.0015:
-            qty = 0.0015  # evita erro "position over maximum"
-        print(f"📦 Quantidade ajustada: {qty} BTC")
+            qty = 0.001
+        print(f"📦 Quantidade final enviada: {qty} BTC")
 
-        # 🚀 Executa a ordem
+        # 🚀 Executa ordem
         if action == 'buy':
             order = client.new_order(symbol=symbol, side="BUY", type="MARKET", quantity=qty)
-            print("✅ Ordem de COMPRA enviada:", order)
+            print("✅ Ordem de COMPRA:", order)
             return jsonify({"status": "✅ Buy executado", "qty": qty})
 
         elif action == 'sell':
             order = client.new_order(symbol=symbol, side="SELL", type="MARKET", quantity=qty)
-            print("✅ Ordem de VENDA enviada:", order)
+            print("✅ Ordem de VENDA:", order)
             return jsonify({"status": "✅ Sell executado", "qty": qty})
 
         else:
-            print("❌ Ação inválida recebida:", action)
+            print("❌ Ação inválida:", action)
             return jsonify({"status": "❌ Ação inválida"}), 400
 
     except Exception as e:
