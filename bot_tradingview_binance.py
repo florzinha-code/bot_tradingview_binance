@@ -4,6 +4,7 @@ import json, os
 
 app = Flask(__name__)
 
+# 🔑 Suas chaves da Binance (definidas no Render Environment)
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 
@@ -14,41 +15,59 @@ def webhook():
     try:
         data = json.loads(request.data)
         action = data.get('action')
-        print(f"📩 ALERTA RECEBIDO: {action}")
+        print(f"🚨 ALERTA RECEBIDO: {action}")
 
-        # --- saldo disponível ---
-        balance_data = client.balance()
-        usdt_balance = float(next(b['balance'] for b in balance_data if b['asset'] == 'USDT'))
-        print(f"💰 Saldo FUTUROS USDT-M detectado: {usdt_balance:.2f} USDT")
+        # Saldo disponível
+        balance = client.balance()
+        usdt_balance = next(
+            (float(b['balance']) for b in balance if b['asset'] == 'USDT'), 0.0)
+        print(f"💰 Saldo FUTUROS USDT-M detectado: {usdt_balance:.3f} USDT")
 
-        # --- preço atual do BTC ---
-        ticker = client.ticker_price(symbol="BTCUSDT")
-        price = float(ticker["price"])
-        print(f"📈 Preço atual BTCUSDT: {price}")
+        if usdt_balance <= 5:
+            return jsonify({"status": "❌ Saldo insuficiente"}), 400
 
-        # --- define modo isolado e alavancagem 1x ---
-        client.change_margin_type(symbol="BTCUSDT", marginType="ISOLATED")
-        client.change_leverage(symbol="BTCUSDT", leverage=1)
+        # Configurações básicas
+        symbol = "BTCUSDT"
+        leverage = 1
+        margin_type = "ISOLATED"
 
-        # --- calcula quantidade: 99% do saldo disponível ---
-        quantity = round((usdt_balance * 0.99) / price, 4)
-        print(f"📊 Quantidade calculada: {quantity} BTC (≈99% do saldo)")
+        # Verifica e define margem isolada somente se necessário
+        try:
+            info = client.get_position_mode()
+            client.change_margin_type(symbol=symbol, marginType=margin_type)
+        except Exception as e:
+            if "No need to change margin type" not in str(e):
+                print("⚠️ Erro ao alterar tipo de margem:", e)
 
-        if action == "buy":
-            order = client.new_order(symbol="BTCUSDT", side="BUY", type="MARKET", quantity=quantity)
-            print(order)
-            return jsonify({"status": "✅ COMPRA executada", "quantidade": quantity})
+        client.change_leverage(symbol=symbol, leverage=leverage)
 
-        elif action == "sell":
-            order = client.new_order(symbol="BTCUSDT", side="SELL", type="MARKET", quantity=quantity)
-            print(order)
-            return jsonify({"status": "✅ VENDA executada", "quantidade": quantity})
+        # Preço atual do BTC
+        ticker = client.ticker_price(symbol=symbol)
+        price = float(ticker['price'])
+        print(f"💹 Preço atual BTCUSDT: {price}")
+
+        # Calcula quantidade (99% do saldo disponível)
+        qty = round((usdt_balance * 0.99) / price, 4)
+        print(f"📦 Quantidade calculada: {qty} BTC")
+
+        # Execução da ordem
+        if action == 'buy':
+            order = client.new_order(symbol=symbol, side="BUY",
+                                     type="MARKET", quantity=qty)
+            print("✅ Ordem de COMPRA enviada:", order)
+            return jsonify({"status": "✅ Buy executado", "qty": qty})
+
+        elif action == 'sell':
+            order = client.new_order(symbol=symbol, side="SELL",
+                                     type="MARKET", quantity=qty)
+            print("✅ Ordem de VENDA enviada:", order)
+            return jsonify({"status": "✅ Sell executado", "qty": qty})
 
         else:
             return jsonify({"status": "❌ Ação inválida"}), 400
 
     except Exception as e:
-        print("⚠️ Erro geral:", e)
+        print("❌ Erro geral:", e)
         return jsonify({"error": str(e)}), 500
 
 
