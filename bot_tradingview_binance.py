@@ -1,79 +1,61 @@
+# === bot_tradingview_binance ===
+# Flask + Binance Futures (USDT-M) webhook handler
+
 from flask import Flask, request, jsonify
-from binance.client import Client
-import json, os, math
+from binance.um_futures import UMFutures
+import os
+import json
 
 app = Flask(__name__)
 
-# 🟢 Chaves Binance (defina em "Environment" no Render)
+# === 🔐 Chaves da Binance ===
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 
-client = Client(API_KEY, API_SECRET)
+client = UMFutures(key=API_KEY, secret=API_SECRET)
 
-# ===============================
-# 🔹 Função para calcular 100% do saldo disponível
-# ===============================
-def get_full_balance_qty(symbol="BTCUSDT"):
-    try:
-        balance = float(client.futures_account_balance()[1]["balance"])  # USDT balance
-        ticker = float(client.futures_mark_price(symbol=symbol)["markPrice"])
-        qty = balance / ticker  # converte saldo USDT para quantidade BTC
-        return round_qty(symbol, qty)
-    except Exception as e:
-        print("Erro ao calcular quantidade:", e)
-        return 0.0
+# === 🧮 Função para calcular quantidade usando 100% da margem disponível ===
+def get_max_qty(symbol):
+    # saldo disponível em USDT na carteira de Futuros
+    balance = float(next(b['balance'] for b in client.balance() if b['asset'] == 'USDT'))
+    # preço de mercado atual do BTC/USDT
+    price = float(client.ticker_price(symbol=symbol)['price'])
+    # converte o saldo em quantidade de BTC (99% para evitar erro de arredondamento)
+    qty = (balance / price) * 0.99
+    return round(qty, 4)  # arredonda pra 4 casas decimais
 
-# 🔹 Arredondamento da quantidade mínima válida
-def round_qty(symbol, qty):
-    info = client.futures_exchange_info()
-    lot = next(s for s in info["symbols"] if s["symbol"] == symbol)
-    step = float(next(f["stepSize"] for f in lot["filters"] if f["filterType"] == "LOT_SIZE"))
-    return math.floor(qty / step) * step
-
-# ===============================
-# 🔹 Rota principal (webhook)
-# ===============================
+# === 🧠 Webhook principal ===
 @app.route('/', methods=['POST'])
 def webhook():
     try:
-        data = json.loads(request.data or "{}")
-        action = (data.get("action") or "").lower()
-        symbol = "BTCUSDT"
-        qty = get_full_balance_qty(symbol)
+        data = json.loads(request.data)
+        print("🚨 Alerta recebido:", data)
+
+        action = data.get('action')
+        symbol = 'BTCUSDT'
+        qty = get_max_qty(symbol)
 
         if qty <= 0:
-            return jsonify({"status": "❌ Saldo insuficiente"}), 400
+            return jsonify({'status': '❌ Saldo insuficiente', 'quantity': qty}), 400
 
-        if action == "buy":
-            order = client.futures_create_order(
-                symbol=symbol, side="BUY", type="MARKET", quantity=qty
-            )
-            return jsonify({"status": "✅ BUY executada", "qty": qty, "orderId": order["orderId"]})
+        if action == 'buy':
+            order = client.new_order(symbol=symbol, side='BUY', type='MARKET', quantity=qty)
+            print("✅ Ordem de COMPRA executada:", order)
+            return jsonify({'status': '✅ Ordem de COMPRA executada', 'quantity': qty})
 
-        elif action == "sell":
-            order = client.futures_create_order(
-                symbol=symbol, side="SELL", type="MARKET", quantity=qty
-            )
-            return jsonify({"status": "✅ SELL executada", "qty": qty, "orderId": order["orderId"]})
-
-        elif action == "stop_buy":
-            order = client.futures_create_order(
-                symbol=symbol, side="BUY", type="MARKET", quantity=qty, reduceOnly=True
-            )
-            return jsonify({"status": "✅ CLOSE SHORT (stop_buy)", "qty": qty, "orderId": order["orderId"]})
-
-        elif action == "stop_sell":
-            order = client.futures_create_order(
-                symbol=symbol, side="SELL", type="MARKET", quantity=qty, reduceOnly=True
-            )
-            return jsonify({"status": "✅ CLOSE LONG (stop_sell)", "qty": qty, "orderId": order["orderId"]})
+        elif action == 'sell':
+            order = client.new_order(symbol=symbol, side='SELL', type='MARKET', quantity=qty)
+            print("✅ Ordem de VENDA executada:", order)
+            return jsonify({'status': '✅ Ordem de VENDA executada', 'quantity': qty})
 
         else:
-            return jsonify({"status": "❌ Ação inválida"}), 400
+            return jsonify({'status': '❌ Ação inválida', 'data': data}), 400
 
     except Exception as e:
         print("⚠️ Erro no webhook:", e)
-        return jsonify({"error": str(e)}), 500
+        return jsonify({'error': str(e)}), 500
 
+
+# === 🚀 Executa o servidor ===
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
