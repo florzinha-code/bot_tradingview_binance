@@ -30,15 +30,15 @@ def webhook():
 
         symbol = "BTCUSDT"
         leverage = 1
-        margin_type = "CROSSED"  # <-- modo Cross
+        margin_type = "ISOLATED"  # <-- modo Isolado
 
         # 🔧 Define modo de margem e alavancagem
         try:
             client.change_margin_type(symbol=symbol, marginType=margin_type)
-            print("✅ Modo de margem definido como CROSS")
+            print("✅ Modo de margem definido como ISOLADO")
         except Exception as e:
             if "No need to change margin type" in str(e):
-                print("ℹ️ Margem já está CROSS.")
+                print("ℹ️ Margem já está ISOLADA.")
             else:
                 print("⚠️ Erro ao mudar margem:", e)
 
@@ -49,8 +49,8 @@ def webhook():
         price = float(client.ticker_price(symbol=symbol)['price'])
         print(f"💹 Preço atual BTCUSDT: {price}")
 
-        # 📦 Calcula quantidade — 85% do saldo / preço (3 casas decimais)
-        qty = (usdt_balance * 0.85) / price
+        # 📦 Calcula quantidade — 90% do saldo / preço (3 casas decimais)
+        qty = (usdt_balance * 0.90) / price
         qty = round(qty, 3)
 
         # Garante mínimo aceito pela Binance
