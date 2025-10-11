@@ -30,15 +30,15 @@ def webhook():
 
         symbol = "BTCUSDT"
         leverage = 1
-        margin_type = "ISOLATED"
+        margin_type = "CROSSED"  # <-- modo Cross
 
-        # 🔧 Define margem isolada e alavancagem
+        # 🔧 Define modo de margem e alavancagem
         try:
             client.change_margin_type(symbol=symbol, marginType=margin_type)
-            print("✅ Modo de margem definido como ISOLADO")
+            print("✅ Modo de margem definido como CROSS")
         except Exception as e:
             if "No need to change margin type" in str(e):
-                print("ℹ️ Margem já está ISOLADA.")
+                print("ℹ️ Margem já está CROSS.")
             else:
                 print("⚠️ Erro ao mudar margem:", e)
 
