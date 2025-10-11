@@ -4,59 +4,56 @@ import os, json
 
 app = Flask(__name__)
 
-# === Chaves de API ===
+# === CHAVES DA BINANCE ===
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 
+# === Cliente de FUTUROS USDT-M ===
 client = UMFutures(key=API_KEY, secret=API_SECRET)
 
 @app.route('/', methods=['POST'])
 def webhook():
     try:
         data = json.loads(request.data)
-        print("\n🚨 ALERTA RECEBIDO:", data)
+        action = data.get("action")
+        print(f"\n🚨 ALERTA RECEBIDO: {action}")
 
-        # --- DEBUG 1: Ver saldo da conta FUTUROS USDT-M
-        balance_info = client.balance()
-        print("\n📊 DEBUG — Retorno completo do client.balance():")
-        print(json.dumps(balance_info, indent=4))
-
-        # Procura saldo em USDT
-        usdt_balance = 0.0
-        for b in balance_info:
+        # --- Verifica saldo na conta de FUTUROS USDT-M
+        balances = client.balance()
+        usdt_balance = 0
+        for b in balances:
             if b.get("asset") == "USDT":
                 usdt_balance = float(b.get("balance", 0))
-        print(f"💰 Saldo disponível em Futuros USDT-M: {usdt_balance} USDT")
+        print(f"💰 Saldo FUTUROS USDT-M detectado: {usdt_balance} USDT")
 
-        # --- DEBUG 2: Ver preço do BTCUSDT
-        ticker = client.ticker_price(symbol="BTCUSDT")
+        # --- Obtém preço do BTCUSDT
+        ticker = client.ticker_price("BTCUSDT")
         price = float(ticker["price"])
         print(f"📈 Preço atual BTCUSDT: {price}")
 
-        # Calcula 100% do saldo
-        qty = round(usdt_balance / price, 4)
-        print(f"📏 Quantidade calculada: {qty} BTC")
+        # --- Calcula tamanho da posição (100% do saldo)
+        qty = round(usdt_balance / price, 3)
+        if qty <= 0:
+            return jsonify({"status": "❌ Saldo insuficiente (USDT=0)", "balance": usdt_balance}), 400
 
-        action = data.get("action")
+        print(f"📦 Quantidade calculada: {qty} BTC")
 
+        # --- Envia ordem FUTUROS
         if action == "buy":
-            print("🟢 Enviando ordem de COMPRA (LONG)")
             order = client.new_order(symbol="BTCUSDT", side="BUY", type="MARKET", quantity=qty)
-            print("📦 Retorno da Binance:", order)
+            print("✅ Ordem de COMPRA executada:", order)
             return jsonify({"status": "✅ Compra executada", "quantity": qty})
 
         elif action == "sell":
-            print("🔴 Enviando ordem de VENDA (SHORT)")
             order = client.new_order(symbol="BTCUSDT", side="SELL", type="MARKET", quantity=qty)
-            print("📦 Retorno da Binance:", order)
+            print("✅ Ordem de VENDA executada:", order)
             return jsonify({"status": "✅ Venda executada", "quantity": qty})
 
         else:
-            print("⚠️ Ação inválida recebida:", action)
-            return jsonify({"status": "❌ Ação inválida"}), 400
+            return jsonify({"status": "❌ Ação inválida recebida"}), 400
 
     except Exception as e:
-        print("\n❗ ERRO DETECTADO:", e)
+        print(f"⚠️ Erro geral: {e}")
         return jsonify({"status": f"⚠️ Erro: {str(e)}"}), 500
 
 
