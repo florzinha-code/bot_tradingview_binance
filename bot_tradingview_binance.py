@@ -49,8 +49,8 @@ def webhook():
         price = float(client.ticker_price(symbol=symbol)['price'])
         print(f"💹 Preço atual BTCUSDT: {price}")
 
-        # 📦 Calcula quantidade — 97% do saldo / preço (3 casas decimais)
-        qty = (usdt_balance * 0.97) / price
+        # 📦 Calcula quantidade — 95% do saldo / preço (3 casas decimais)
+        qty = (usdt_balance * 0.95) / price
         qty = round(qty, 3)
 
         # Garante mínimo aceito pela Binance
