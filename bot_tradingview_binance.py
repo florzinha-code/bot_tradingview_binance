@@ -6,8 +6,8 @@ import os
 app = Flask(__name__)
 
 # 🟢 Suas chaves Binance
-API_KEY = "Jh33OLr6yEDfPCujosXuCnMsmCPg7Mh0R1HJ7j8PvQFfBkrQtSwFGAjIH8w9vanU"
-API_SECRET = "WMi3P0kOUQbjg5NAXKlNHRdaGFGW7GVXoOG0G0517wWTrTZLT2MaGMcqr2gzwFxT"
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
 
 client = Client(API_KEY, API_SECRET)
 
