@@ -28,49 +28,49 @@ def webhook():
         if usdt_balance <= 5:
             return jsonify({"status": "❌ Saldo insuficiente"}), 400
 
-        # ⚙️ Configurações principais
         symbol = "BTCUSDT"
         leverage = 1
-        margin_type = "CROSSED"  # ← modo cross margin
+        margin_type = "ISOLATED"
 
-        # 🔧 Define tipo de margem (Cross) e alavancagem
+        # 🔧 Define margem isolada e alavancagem
         try:
             client.change_margin_type(symbol=symbol, marginType=margin_type)
-            print(f"✅ Modo de margem definido como {margin_type}")
+            print("✅ Modo de margem definido como ISOLADO")
         except Exception as e:
             if "No need to change margin type" in str(e):
-                print(f"ℹ️ Margem já está {margin_type}.")
+                print("ℹ️ Margem já está ISOLADA.")
             else:
-                print("⚠️ Erro ao mudar tipo de margem:", e)
+                print("⚠️ Erro ao mudar margem:", e)
 
         client.change_leverage(symbol=symbol, leverage=leverage)
-        print(f"⚙️ Alavancagem ajustada para {leverage}x")
+        print(f"⚙️ Alavancagem definida: {leverage}x")
 
-        # 📈 Preço atual do BTC
+        # 📈 Preço atual
         price = float(client.ticker_price(symbol=symbol)['price'])
         print(f"💹 Preço atual BTCUSDT: {price}")
 
-        # 📦 Calcula quantidade — 99% do saldo / preço
-        qty = (usdt_balance * 0.99) / price
+        # 📦 Calcula quantidade — 99% do saldo / preço (3 casas decimais)
+        qty = (usdt_balance * 0.97) / price
         qty = round(qty, 3)
+
+        # Garante mínimo aceito pela Binance
         if qty < 0.001:
             qty = 0.001
-
-        print(f"📦 Quantidade final calculada: {qty} BTC")
+        print(f"📦 Quantidade final enviada: {qty} BTC")
 
         # 🚀 Executa ordem
         if action == 'buy':
             order = client.new_order(symbol=symbol, side="BUY", type="MARKET", quantity=qty)
-            print("✅ Ordem de COMPRA enviada:", order)
+            print("✅ Ordem de COMPRA:", order)
             return jsonify({"status": "✅ Buy executado", "qty": qty})
 
         elif action == 'sell':
             order = client.new_order(symbol=symbol, side="SELL", type="MARKET", quantity=qty)
-            print("✅ Ordem de VENDA enviada:", order)
+            print("✅ Ordem de VENDA:", order)
             return jsonify({"status": "✅ Sell executado", "qty": qty})
 
         else:
-            print("❌ Ação inválida recebida:", action)
+            print("❌ Ação inválida:", action)
             return jsonify({"status": "❌ Ação inválida"}), 400
 
     except Exception as e:
