@@ -1,3 +1,3 @@
 flask
-python-binance==1.0.19
+python-binance
 gunicorn
