@@ -23,7 +23,7 @@ RSI_WIN_LONG = (40.0, 65.0)
 RSI_WIN_SHORT = (35.0, 60.0)
 MIN_QTY = 0.001
 NO_TICK_RESTART_S = 120
-HEARTBEAT_S = 60
+HEARTBEAT_S = 30   # ✅ reduzido para 30 segundos
 # ===================== CONFIG =====================
 
 API_KEY = os.getenv("API_KEY")
@@ -208,14 +208,15 @@ def run_ws():
                 print("⚠️ on_msg error:", e)
                 traceback.print_exc()
 
-        # heartbeat pings
+        # heartbeat pings (a cada 30s)
         def heartbeat():
             while True:
                 time.sleep(HEARTBEAT_S)
                 try:
                     ws.ping()
-                    print("💓 Heartbeat enviado")
+                    print("💓 Heartbeat enviado (ping 30s)")
                 except Exception:
+                    print("⚠️ Heartbeat falhou, encerrando thread…")
                     break
 
         try:
