@@ -1,11 +1,12 @@
 # ws_bot_renko.py / bot_tradingview_binance_ws.py
 # Binance Futures WebSocket — Renko 550 pts + EMA9/21 + RSI14 + reversão = stop
 # Versão 24/7 com:
-#  ✅ Reconexão instantânea (0.1s)
-#  ✅ Heartbeat a cada 30s
-#  ✅ Debounce de ordens no mesmo brick
-#  ✅ Auto-relogin se a sessão cair
-#  ✅ Logs coloridos (Render-friendly)
+# ✅ PnL detalhado (USDT + %)
+# ✅ Reconexão instantânea (0.1s)
+# ✅ Heartbeat a cada 30s
+# ✅ Debounce de ordens no mesmo brick
+# ✅ Auto-relogin se a sessão cair
+# ✅ Logs coloridos Render-friendly
 
 import os, time, math, json, traceback, functools, threading
 from binance.um_futures import UMFutures
@@ -149,6 +150,26 @@ def get_qty(price):
     qty = round(max(MIN_QTY, (usdt * QTY_PCT) / price), 3)
     return qty, usdt
 
+# --- Exibir PnL ---
+def show_pnl():
+    try:
+        pos_data = client.get_position_risk(symbol=SYMBOL)
+        if pos_data:
+            pos = pos_data[0]
+            pnl = float(pos.get("unRealizedProfit", 0))
+            entry = float(pos.get("entryPrice", 0))
+            amt = float(pos.get("positionAmt", 0))
+            side = "LONG" if amt > 0 else "SHORT" if amt < 0 else "FLAT"
+            if amt != 0 and entry > 0:
+                mark = float(pos.get("markPrice", 0))
+                pct = ((mark - entry) / entry * 100) * (1 if amt > 0 else -1)
+            else:
+                pct = 0.0
+            color = GREEN if pnl >= 0 else RED
+            print(f"{color}💰 PnL: {pnl:.2f} USDT | Δ={pct:.3f}% | Entrada: {entry:.2f} | Qty: {amt:.4f} | {side}{RESET}")
+    except Exception as e:
+        print(f"{YELLOW}⚠️ Erro ao obter PnL:{RESET}", e)
+
 # --- Execução de ordens ---
 def market_order(side, qty, reduce_only=False):
     params = dict(symbol=SYMBOL, side=side, type="MARKET", quantity=qty)
@@ -157,6 +178,8 @@ def market_order(side, qty, reduce_only=False):
     try:
         client.new_order(**params)
         print(f"{GREEN}✅ Ordem {side} qty={qty} reduceOnly={reduce_only}{RESET}")
+        time.sleep(0.2)
+        show_pnl()
         return True
     except Exception as e:
         print(f"{RED}❌ Erro ao enviar ordem:{RESET}", e)
@@ -181,9 +204,9 @@ def apply_logic_on_brick(state, brick_close, dir, brick_id):
 
     renkoVerde = dir == 1
     renkoVermelho = dir == -1
-
     def order_key(side): return f"{side}_{brick_id}_{round(brick_close)}"
 
+    # Stops
     if state.in_long and renkoVermelho:
         key = order_key("STOP_LONG")
         if key != state.last_order_key:
@@ -200,6 +223,7 @@ def apply_logic_on_brick(state, brick_close, dir, brick_id):
                 state.in_short = False
                 state.last_order_key = key
 
+    # Entradas
     if renkoVerde and (e1 > e2) and (RSI_WIN_LONG[0] <= rsi <= RSI_WIN_LONG[1]) and not state.in_long:
         key = order_key("BUY")
         if key != state.last_order_key:
@@ -219,7 +243,6 @@ def apply_logic_on_brick(state, brick_close, dir, brick_id):
 # --- WebSocket principal ---
 def run_ws():
     setup_symbol()
-
     while True:
         state = StrategyState()
         renko = RenkoEngine(BOX_POINTS, REV_BOXES)
