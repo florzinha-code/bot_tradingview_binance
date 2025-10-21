@@ -2,7 +2,7 @@
 # Bot WebSocket Binance Futures — Renko 550 pts + EMA9/21 + RSI14 + reversão = stop
 # Mantém toda a lógica original com correções para rodar 24/7 no Render
 
-import os, math, time, threading, traceback
+import os, math, time, threading, traceback, requests
 from flask import Flask
 from binance.um_futures import UMFutures
 from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
@@ -217,6 +217,20 @@ def home():
 
 threading.Thread(target=run_ws, daemon=True).start()
 
+# ===================== KEEPALIVE INTERNO =====================
+def keep_alive():
+    url = "https://bot-tradingview-binance.onrender.com/"
+    while True:
+        try:
+            requests.get(url, timeout=10)
+            print("🌐 Keepalive ping enviado com sucesso.")
+        except Exception as e:
+            print("⚠️ Erro no keepalive:", e)
+        time.sleep(600)  # 10 minutos
+
+threading.Thread(target=keep_alive, daemon=True).start()
+
 if __name__ == "__main__":
     PORT = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=PORT)
+
