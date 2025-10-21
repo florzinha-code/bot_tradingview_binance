@@ -1,33 +1,31 @@
 # ws_bot_renko.py
 # Bot WebSocket Binance Futures — Renko 550 pts + EMA9/21 + RSI14 + reversão = stop
-# Mantém toda a lógica original + ping automático para manter Render acordado
+# Versão 24/7 para plano Starter (sem Flask / sem keepalive)
 
-import os, math, time, threading, traceback, requests
-from flask import Flask
+import os, math, time, traceback
 from binance.um_futures import UMFutures
 from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
 
 # ===================== CONFIG =====================
-SYMBOL         = "BTCUSDT"
-LEVERAGE       = 1
-MARGIN_TYPE    = "CROSSED"
-QTY_PCT        = 0.85
-BOX_POINTS     = 550.0
-REV_BOXES      = 2
-EMA_FAST       = 9
-EMA_SLOW       = 21
-RSI_LEN        = 14
-RSI_WIN_LONG   = (40.0, 65.0)
-RSI_WIN_SHORT  = (35.0, 60.0)
-MIN_QTY        = 0.001
-KEEPALIVE_URL  = os.getenv("RENDER_URL", "https://bot-tradingview-binance.onrender.com")
+SYMBOL       = "BTCUSDT"
+LEVERAGE     = 1
+MARGIN_TYPE  = "CROSSED"
+QTY_PCT      = 0.85
+BOX_POINTS   = 550.0
+REV_BOXES    = 2
+EMA_FAST     = 9
+EMA_SLOW     = 21
+RSI_LEN      = 14
+RSI_WIN_LONG = (40.0, 65.0)
+RSI_WIN_SHORT = (35.0, 60.0)
+MIN_QTY      = 0.001
 # ===================== CONFIG =====================
 
 API_KEY    = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 client = UMFutures(key=API_KEY, secret=API_SECRET)
 
-# --- Setup de margem/alavancagem ---
+# --- setup margin/leverage ---
 def setup_symbol():
     try:
         client.change_margin_type(symbol=SYMBOL, marginType=MARGIN_TYPE)
@@ -43,7 +41,6 @@ def setup_symbol():
     except Exception as e:
         print("⚠️ change_leverage:", e)
 
-
 # --- EMA ---
 class EMA:
     def __init__(self, length:int):
@@ -57,7 +54,7 @@ class EMA:
             self.value = (x - self.value)*self.mult + self.value
         return self.value
 
-# --- RSI (Wilder) ---
+# --- RSI ---
 class RSI_Wilder:
     def __init__(self, length:int):
         self.len = length
@@ -81,20 +78,18 @@ class RSI_Wilder:
         rs = self.avgU / denom
         return 100.0 - 100.0/(1.0+rs)
 
-# --- Motor Renko fixo ---
+# --- Renko Engine ---
 class RenkoEngine:
     def __init__(self, box_points:float, rev_boxes:int):
         self.box = float(box_points)
         self.rev = int(rev_boxes)
         self.anchor = None
         self.dir = 0
-        self.last_brick_close = None
         self.brick_id = 0
     def feed_price(self, px:float):
         created = []
         if self.anchor is None:
             self.anchor = px
-            self.last_brick_close = px
             return created
         up_th = self.anchor + self.box
         down_th = self.anchor - self.box
@@ -120,8 +115,7 @@ class RenkoEngine:
             down_th = self.anchor - self.box
         return created
 
-
-# --- Estado e indicadores ---
+# --- Estado da estratégia ---
 class StrategyState:
     def __init__(self):
         self.in_long = False
@@ -129,13 +123,11 @@ class StrategyState:
         self.ema_fast = EMA(EMA_FAST)
         self.ema_slow = EMA(EMA_SLOW)
         self.rsi = RSI_Wilder(RSI_LEN)
-
     def update_indics(self, brick_close:float):
         e1 = self.ema_fast.update(brick_close)
         e2 = self.ema_slow.update(brick_close)
         rsi = self.rsi.update(brick_close)
         return e1, e2, rsi
-
 
 # --- Quantidade dinâmica ---
 def get_qty(price:float):
@@ -144,22 +136,20 @@ def get_qty(price:float):
     qty = round(max(MIN_QTY, (usdt * QTY_PCT) / price), 3)
     return qty, usdt
 
-
 # --- Execução de ordens ---
 def market_order(side:str, qty:float, reduce_only:bool=False):
     params = dict(symbol=SYMBOL, side=side, type="MARKET", quantity=qty)
     if reduce_only:
         params["reduceOnly"] = "true"
     try:
-        order = client.new_order(**params)
+        client.new_order(**params)
         print(f"✅ Ordem {side} qty={qty} reduceOnly={reduce_only}")
         return True
     except Exception as e:
         print("❌ Erro ao enviar ordem:", e)
         return False
 
-
-# --- Lógica da estratégia (idêntica ao Pine) ---
+# --- Lógica principal ---
 def apply_logic_on_brick(state:StrategyState, brick_close:float, dir:int, brick_id:int):
     e1, e2, rsi = state.update_indics(brick_close)
     if e1 is None or e2 is None or rsi is None:
@@ -185,7 +175,6 @@ def apply_logic_on_brick(state:StrategyState, brick_close:float, dir:int, brick_
         if market_order("SELL", qty):
             state.in_short, state.in_long = True, False
 
-
 # --- WebSocket principal ---
 def run_ws():
     setup_symbol()
@@ -207,36 +196,7 @@ def run_ws():
     ws.agg_trade(symbol=SYMBOL.lower(), id=1, callback=on_msg)
     print("▶️ WebSocket iniciado — ouvindo aggTrade", SYMBOL)
     while True:
-        try:
-            time.sleep(1)
-        except Exception:
-            print("⚠️ Loop principal reiniciado...")
-            ws.stop()
-            time.sleep(3)
-            run_ws()
-
-
-# ===================== FLASK + KEEPALIVE =====================
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "✅ Bot WebSocket Binance ativo e rodando."
-
-
-def keepalive_loop():
-    while True:
-        try:
-            r = requests.get(KEEPALIVE_URL, timeout=10)
-            print(f"🔁 Keepalive ping: {r.status_code} → {KEEPALIVE_URL}")
-        except Exception as e:
-            print("⚠️ Keepalive falhou:", e)
-        time.sleep(300)  # 5 minutos
-
-# Threads paralelas: WS + Keepalive
-threading.Thread(target=run_ws, daemon=True).start()
-threading.Thread(target=keepalive_loop, daemon=True).start()
+        time.sleep(1)
 
 if __name__ == "__main__":
-    PORT = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=PORT)
+    run_ws()
