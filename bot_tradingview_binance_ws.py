@@ -1,24 +1,25 @@
 # ws_bot_renko.py
 # Bot WebSocket Binance Futures — Renko 550 pts + EMA9/21 + RSI14 + reversão = stop
 # Versão 24/7 para plano Starter (sem Flask / sem keepalive)
+# Corrigida para nova versão da binance-futures-connector (sem ws.start)
 
 import os, math, time, traceback
 from binance.um_futures import UMFutures
 from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
 
 # ===================== CONFIG =====================
-SYMBOL       = "BTCUSDT"
-LEVERAGE     = 1
-MARGIN_TYPE  = "CROSSED"
-QTY_PCT      = 0.85
-BOX_POINTS   = 550.0
-REV_BOXES    = 2
-EMA_FAST     = 9
-EMA_SLOW     = 21
-RSI_LEN      = 14
-RSI_WIN_LONG = (40.0, 65.0)
+SYMBOL        = "BTCUSDT"
+LEVERAGE      = 1
+MARGIN_TYPE   = "CROSSED"
+QTY_PCT       = 0.85
+BOX_POINTS    = 550.0
+REV_BOXES     = 2
+EMA_FAST      = 9
+EMA_SLOW      = 21
+RSI_LEN       = 14
+RSI_WIN_LONG  = (40.0, 65.0)
 RSI_WIN_SHORT = (35.0, 60.0)
-MIN_QTY      = 0.001
+MIN_QTY       = 0.001
 # ===================== CONFIG =====================
 
 API_KEY    = os.getenv("API_KEY")
@@ -192,9 +193,11 @@ def run_ws():
             print("⚠️ on_msg error:", e)
             traceback.print_exc()
 
-    ws.start()
+    # ✅ Corrigido: .start() removido
     ws.agg_trade(symbol=SYMBOL.lower(), id=1, callback=on_msg)
     print("▶️ WebSocket iniciado — ouvindo aggTrade", SYMBOL)
+
+    # Mantém processo ativo para plano Starter
     while True:
         time.sleep(1)
 
