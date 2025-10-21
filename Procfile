@@ -1,1 +1,1 @@
-web: gunicorn bot_tradingview_binance:app
+worker: python bot_tradingview_binance_ws.py
