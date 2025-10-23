@@ -1,12 +1,14 @@
 # bot_tradingview_binance_ws.py
 # Binance Futures WebSocket — Renko 550 pts + EMA9/21 + RSI14 + reversão = stop
-#  ✅ PnL detalhado (USDT + %)
-#  ✅ Reconexão instantânea + watchdog
-#  ✅ Heartbeat 30s (silencioso)
-#  ✅ Debounce direcional (permite STOP + reversão no mesmo brick)
-#  ✅ Auto-relogin (recria UMFutures em erro)
-#  ✅ Streams duplos (aggTrade + markPrice)
-#  ✅ Fallback HTTP (ticker_price) quando WS fica silencioso
+# ✅ Warm-up de histórico (alinha com TradingView)
+# ✅ PnL detalhado (USDT + %)
+# ✅ Reconexão instantânea + watchdog
+# ✅ Heartbeat 30s (silencioso)
+# ✅ Debounce direcional (permite STOP + reversão no mesmo brick)
+# ✅ Auto-relogin (recria UMFutures em erro)
+# ✅ Streams duplos (aggTrade + markPrice)
+# ✅ Fallback HTTP (ticker_price) quando WS fica silencioso
+# ✅ Logs enxutos (1 linha por brick + ordens)
 
 import os, time, json, traceback, functools, threading
 from binance.um_futures import UMFutures
@@ -33,14 +35,21 @@ RSI_WIN_LONG = (40.0, 65.0)
 RSI_WIN_SHORT= (35.0, 60.0)
 MIN_QTY      = 0.001
 
-NO_TICK_RESTART_S = 90           # watchdog do WS
-HEARTBEAT_S       = 30           # ping silencioso
-SILENT_HEARTBEAT  = True
+# Robustez
+NO_TICK_RESTART_S       = 90       # watchdog do WS
+HEARTBEAT_S             = 30       # ping silencioso
+SILENT_HEARTBEAT        = True
 
 # Fallback HTTP
 HTTP_FALLBACK            = True
-HTTP_FALLBACK_AFTER_S    = 2.0   # se WS ficar >2s sem tick, ativa HTTP feeder
-HTTP_FALLBACK_INTERVAL_S = 0.5   # frequência do feeder
+HTTP_FALLBACK_AFTER_S    = 2.0     # se WS ficar >2s sem tick, ativa HTTP feeder
+HTTP_FALLBACK_INTERVAL_S = 0.5
+
+# Warm-up (carrega Renko/indicadores com histórico p/ não depender de mexer $550 “nesta sessão”)
+WARMUP_ENABLED     = True
+WARMUP_INTERVAL    = "1m"          # 1 minuto
+WARMUP_LIMIT       = 1000          # últimas N velas (ajuste se quiser mais)
+WARMUP_LOG_EVERY   = 0             # 0 = não loga cada passo; >0 = loga a cada N bricks no warmup
 
 API_KEY    = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
@@ -123,7 +132,7 @@ class StrategyState:
         self.in_long=False; self.in_short=False
         self.ema_fast=EMA(EMA_FAST); self.ema_slow=EMA(EMA_SLOW)
         self.rsi=RSI_Wilder(RSI_LEN)
-        # debounce direcional (apenas entradas, STOP não marca)
+        # debounce direcional (apenas ENTRADAS; STOP não marca → permite STOP+reversão no mesmo brick)
         self.last_brick_id=None
         self.last_side=None  # "BUY" / "SELL"
     def update_indics(self, x:float):
@@ -243,7 +252,7 @@ def apply_logic_on_brick(state:StrategyState, brick_close:float, d:int, brick_id
     def dup_block(side:str)->bool:
         return (state.last_brick_id == brick_id) and (state.last_side == side)
 
-    # STOPs (não marcam last_side para permitir reversão)
+    # STOPs (não marcam last_side → permitem reversão no mesmo brick)
     if state.in_long and renkoVermelh and market_order("SELL", qty, True):
         print(f"{YELLOW}🛑 STOP COMPRA #{brick_id} @ {brick_close:.2f}{RESET}")
         state.in_long = False
@@ -270,12 +279,40 @@ def apply_logic_on_brick(state:StrategyState, brick_close:float, d:int, brick_id
             state.in_short, state.in_long = True, False
             state.last_brick_id, state.last_side = brick_id, "SELL"
 
+# ---------- warm-up ----------
+def warmup_state(state:StrategyState, renko:RenkoEngine):
+    if not WARMUP_ENABLED:
+        return
+    try:
+        kl = client.klines(symbol=SYMBOL, interval=WARMUP_INTERVAL, limit=WARMUP_LIMIT)
+        if not kl:
+            print(f"{YELLOW}⚠️ Warm-up: sem klines retornados.{RESET}")
+            return
+        bricks_before = renko.brick_id
+        for i, row in enumerate(kl):
+            # kline: [open_time, open, high, low, close, volume, ...]
+            close = float(row[4])
+            for brick_close, d, brick_id in renko.feed_price(close):
+                # atualiza indicadores com close do tijolo (não imprime)
+                e1,e2,rsi = state.update_indics(brick_close)
+                if WARMUP_LOG_EVERY and brick_id % WARMUP_LOG_EVERY == 0:
+                    print(f"{GRAY}↺ Warm-up: brick {brick_id} close={brick_close:.2f} | EMA9={e1:.2f} EMA21={e2:.2f}{RESET}")
+        formed = renko.brick_id - bricks_before
+        anchor = renko.anchor
+        print(f"{CYAN}🧰 Warm-up concluído: {formed} bricks formados | anchor={anchor:.2f} | base={WARMUP_INTERVAL} x {WARMUP_LIMIT}{RESET}")
+    except Exception as e:
+        print(f"{YELLOW}⚠️ Warm-up falhou:{RESET}", e)
+
 # ---------- loop WS + fallback ----------
 def run_ws():
     setup_symbol()
     while True:
         state = StrategyState()
         renko = RenkoEngine(BOX_POINTS, REV_BOXES)
+
+        # warm-up Renko/indicadores com histórico recente
+        warmup_state(state, renko)
+
         ws = UMFuturesWebsocketClient()
         last_tick_ts = time.time()
 
@@ -306,7 +343,6 @@ def run_ws():
                     for brick_close, d, brick_id in renko.feed_price(px):
                         apply_logic_on_brick(state, brick_close, d, brick_id, source="HTTP")
                 except Exception:
-                    # ignora erro momentâneo
                     pass
 
         # heartbeat silencioso
