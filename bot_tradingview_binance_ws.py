@@ -3,14 +3,15 @@
 # ✅ Warm-up de histórico (alinha com TradingView)
 # ✅ PnL detalhado (USDT + %)
 # ✅ Reconexão instantânea + watchdog
-# ✅ Heartbeat 30s (silencioso)
+# ✅ Heartbeat 30s (silencioso por padrão)
 # ✅ Debounce direcional (permite STOP + reversão no mesmo brick)
 # ✅ Auto-relogin (recria UMFutures em erro)
 # ✅ Streams duplos (aggTrade + markPrice)
 # ✅ Fallback HTTP (ticker_price) quando WS fica silencioso
 # ✅ Logs enxutos (1 linha por brick + ordens)
+# ✅ TELEMETRIA: loga pacotes WS (full-debug), com amostra crua do JSON
 
-import os, time, json, traceback, functools, threading
+import os, time, json, traceback, functools, threading, datetime as dt
 from binance.um_futures import UMFutures
 from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
 
@@ -45,16 +46,31 @@ HTTP_FALLBACK            = True
 HTTP_FALLBACK_AFTER_S    = 2.0     # se WS ficar >2s sem tick, ativa HTTP feeder
 HTTP_FALLBACK_INTERVAL_S = 0.5
 
-# Warm-up (carrega Renko/indicadores com histórico p/ não depender de mexer $550 “nesta sessão”)
+# Warm-up
 WARMUP_ENABLED     = True
-WARMUP_INTERVAL    = "1m"          # 1 minuto
-WARMUP_LIMIT       = 1000          # últimas N velas (ajuste se quiser mais)
-WARMUP_LOG_EVERY   = 0             # 0 = não loga cada passo; >0 = loga a cada N bricks no warmup
+WARMUP_INTERVAL    = "1m"
+WARMUP_LIMIT       = 1000
+WARMUP_LOG_EVERY   = 0           # 0 = não loga cada passo
+
+# Telemetria
+TELEMETRY_FULL       = True      # liga/desliga logs de pacote WS
+TELEMETRY_RAW_PREVIEW= 220       # chars de JSON bruto pra amostra
+LOG_WS_SOURCE_TAG    = True      # mostra de qual stream veio (aggTrade/markPrice)
 
 API_KEY    = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 
 # ---------- helpers ----------
+def ts():
+    return dt.datetime.utcnow().strftime("%H:%M:%S.%f")[:-3] + "Z"
+
+def preview(obj, limit=TELEMETRY_RAW_PREVIEW):
+    try:
+        raw = obj if isinstance(obj, str) else json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        raw = str(obj)
+    return (raw[:limit] + "…") if len(raw) > limit else raw
+
 def get_client():
     return UMFutures(key=API_KEY, secret=API_SECRET)
 
@@ -132,7 +148,7 @@ class StrategyState:
         self.in_long=False; self.in_short=False
         self.ema_fast=EMA(EMA_FAST); self.ema_slow=EMA(EMA_SLOW)
         self.rsi=RSI_Wilder(RSI_LEN)
-        # debounce direcional (apenas ENTRADAS; STOP não marca → permite STOP+reversão no mesmo brick)
+        # debounce direcional (apenas ENTRADAS)
         self.last_brick_id=None
         self.last_side=None  # "BUY" / "SELL"
     def update_indics(self, x:float):
@@ -246,7 +262,7 @@ def apply_logic_on_brick(state:StrategyState, brick_close:float, d:int, brick_id
 
     # 1 linha por brick + origem do tick
     print(f"{MAGENTA}{'🛰️WS' if source=='WS' else '🌐HTTP'} | "
-          f"🧱 {brick_id} {'▲' if renkoVerde else '▼'} | close={brick_close:.2f} "
+          f"{ts()} | 🧱 {brick_id} {'▲' if renkoVerde else '▼'} | close={brick_close:.2f} "
           f"| EMA9={e1:.2f} EMA21={e2:.2f} | RSI={rsi:.2f}{RESET}")
 
     def dup_block(side:str)->bool:
@@ -290,10 +306,8 @@ def warmup_state(state:StrategyState, renko:RenkoEngine):
             return
         bricks_before = renko.brick_id
         for i, row in enumerate(kl):
-            # kline: [open_time, open, high, low, close, volume, ...]
-            close = float(row[4])
+            close = float(row[4])  # kline[4] = close
             for brick_close, d, brick_id in renko.feed_price(close):
-                # atualiza indicadores com close do tijolo (não imprime)
                 e1,e2,rsi = state.update_indics(brick_close)
                 if WARMUP_LOG_EVERY and brick_id % WARMUP_LOG_EVERY == 0:
                     print(f"{GRAY}↺ Warm-up: brick {brick_id} close={brick_close:.2f} | EMA9={e1:.2f} EMA21={e2:.2f}{RESET}")
@@ -303,7 +317,7 @@ def warmup_state(state:StrategyState, renko:RenkoEngine):
     except Exception as e:
         print(f"{YELLOW}⚠️ Warm-up falhou:{RESET}", e)
 
-# ---------- loop WS + fallback ----------
+# ---------- loop WS + fallback + TELEMETRIA ----------
 def run_ws():
     setup_symbol()
     while True:
@@ -315,16 +329,38 @@ def run_ws():
 
         ws = UMFuturesWebsocketClient()
         last_tick_ts = time.time()
+        ws_msg_count = {"total": 0}
 
-        # feeder via WS
+        # feeder via WS (com telemetria)
         def on_msg(_, message):
             nonlocal last_tick_ts
             try:
+                ws_msg_count["total"] += 1
+                if TELEMETRY_FULL:
+                    # Mostra origem quando possível
+                    origin = "?"
+                    try:
+                        if isinstance(message, str):
+                            m = json.loads(message)
+                        else:
+                            m = message
+                        if isinstance(m, dict):
+                            if m.get("e") == "aggTrade" or "a" in m and "p" in m:
+                                origin = "aggTrade"
+                            elif m.get("e") == "markPriceUpdate":
+                                origin = "markPrice"
+                    except Exception:
+                        pass
+                    print(f"{GRAY}🛰️ WS[{ws_msg_count['total']}] {ts()} | origem={origin} | bytes≈{len(preview(message))} | {preview(message)}{RESET}")
+
                 px = extract_price(message)
                 if px > 0:
                     last_tick_ts = time.time()
                     for brick_close, d, brick_id in renko.feed_price(px):
                         apply_logic_on_brick(state, brick_close, d, brick_id, source="WS")
+                else:
+                    if TELEMETRY_FULL:
+                        print(f"{YELLOW}⛔ Tick ignorado (sem preço válido) | {preview(message)}{RESET}")
             except Exception as e:
                 print(f"{YELLOW}⚠️ on_msg error:{RESET}", e)
                 traceback.print_exc()
@@ -336,16 +372,20 @@ def run_ws():
                 time.sleep(HTTP_FALLBACK_INTERVAL_S)
                 if not HTTP_FALLBACK:
                     continue
-                if time.time() - last_tick_ts < HTTP_FALLBACK_AFTER_S:
+                silence = time.time() - last_tick_ts
+                if silence < HTTP_FALLBACK_AFTER_S:
                     continue  # WS está saudável
                 try:
                     px = float(client.ticker_price(symbol=SYMBOL)['price'])
+                    if TELEMETRY_FULL:
+                        print(f"{GRAY}🌐 HTTP {ts()} | silêncio WS={silence:.2f}s | px={px}{RESET}")
                     for brick_close, d, brick_id in renko.feed_price(px):
                         apply_logic_on_brick(state, brick_close, d, brick_id, source="HTTP")
                 except Exception:
+                    # ignora erro momentâneo
                     pass
 
-        # heartbeat silencioso
+        # heartbeat (pode ser silenciado)
         def heartbeat():
             while not stop_flag["stop"]:
                 time.sleep(HEARTBEAT_S)
@@ -353,7 +393,7 @@ def run_ws():
                     ws.ping()
                     if not SILENT_HEARTBEAT:
                         uptime = round(time.time()-start_ts,1)
-                        print(f"{MAGENTA}💓 Heartbeat (ping {HEARTBEAT_S}s) | Uptime {uptime}s{RESET}")
+                        print(f"{MAGENTA}💓 Heartbeat (ping {HEARTBEAT_S}s) | Uptime {uptime}s | WS_msgs={ws_msg_count['total']}{RESET}")
                 except Exception:
                     break
 
@@ -376,8 +416,9 @@ def run_ws():
         try:
             while True:
                 time.sleep(5)
-                if time.time() - last_tick_ts > NO_TICK_RESTART_S:
-                    print(f"{YELLOW}⏱️ {NO_TICK_RESTART_S}s sem tick WS. Reiniciando WS…{RESET}")
+                silence = time.time() - last_tick_ts
+                if silence > NO_TICK_RESTART_S:
+                    print(f"{YELLOW}⏱️ {silence:.1f}s sem tick WS (limite {NO_TICK_RESTART_S}s). Reiniciando WS…{RESET}")
                     try: ws.stop()
                     except Exception: pass
                     break
