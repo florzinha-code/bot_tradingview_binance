@@ -1,15 +1,14 @@
 # bot_tradingview_binance_ws.py
 # Binance Futures WebSocket — Renko 550 pts + EMA9/21 + RSI14 + reversão = stop
-# ✅ Warm-up de histórico (alinha com TradingView)
+# ✅ Warm-up de histórico (EMA/RSI estáveis) + reancoragem no preço atual
 # ✅ PnL detalhado (USDT + %)
 # ✅ Reconexão instantânea + watchdog
 # ✅ Heartbeat 30s (silencioso por padrão)
-# ✅ Debounce direcional (permite STOP + reversão no mesmo brick)
+# ✅ Debounce direcional (impede duas entradas iguais no mesmo brick)
+# ✅ STOP sem reversão no mesmo brick (reversão só no próximo brick)
 # ✅ Auto-relogin (recria UMFutures em erro)
-# ✅ Streams duplos (aggTrade + markPrice)
-# ✅ Fallback HTTP (ticker_price) quando WS fica silencioso
+# ✅ Streams duplos (aggTrade + markPrice) + Fallback HTTP (ticker_price)
 # ✅ Logs enxutos (1 linha por brick + ordens)
-# ✅ TELEMETRIA: loga pacotes WS (full-debug), com amostra crua do JSON
 
 import os, time, json, traceback, functools, threading, datetime as dt
 from binance.um_futures import UMFutures
@@ -37,25 +36,20 @@ RSI_WIN_SHORT= (35.0, 60.0)
 MIN_QTY      = 0.001
 
 # Robustez
-NO_TICK_RESTART_S       = 90       # watchdog do WS
-HEARTBEAT_S             = 30       # ping silencioso
-SILENT_HEARTBEAT        = True
+NO_TICK_RESTART_S = 90     # watchdog do WS
+HEARTBEAT_S       = 30     # ping silencioso
+SILENT_HEARTBEAT  = True
 
 # Fallback HTTP
 HTTP_FALLBACK            = True
-HTTP_FALLBACK_AFTER_S    = 2.0     # se WS ficar >2s sem tick, ativa HTTP feeder
+HTTP_FALLBACK_AFTER_S    = 2.0
 HTTP_FALLBACK_INTERVAL_S = 0.5
 
 # Warm-up
-WARMUP_ENABLED     = True
-WARMUP_INTERVAL    = "1m"
-WARMUP_LIMIT       = 1000
-WARMUP_LOG_EVERY   = 0           # 0 = não loga cada passo
-
-# Telemetria
-TELEMETRY_FULL       = True      # liga/desliga logs de pacote WS
-TELEMETRY_RAW_PREVIEW= 220       # chars de JSON bruto pra amostra
-LOG_WS_SOURCE_TAG    = True      # mostra de qual stream veio (aggTrade/markPrice)
+WARMUP_ENABLED   = True
+WARMUP_INTERVAL  = "1m"
+WARMUP_LIMIT     = 1000
+REANCHOR_AFTER_WARMUP = True   # <- reancora no preço atual ao final do warm-up
 
 API_KEY    = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
@@ -63,13 +57,6 @@ API_SECRET = os.getenv("API_SECRET")
 # ---------- helpers ----------
 def ts():
     return dt.datetime.utcnow().strftime("%H:%M:%S.%f")[:-3] + "Z"
-
-def preview(obj, limit=TELEMETRY_RAW_PREVIEW):
-    try:
-        raw = obj if isinstance(obj, str) else json.dumps(obj, ensure_ascii=False)
-    except Exception:
-        raw = str(obj)
-    return (raw[:limit] + "…") if len(raw) > limit else raw
 
 def get_client():
     return UMFutures(key=API_KEY, secret=API_SECRET)
@@ -124,6 +111,8 @@ class RenkoEngine:
     def __init__(self, box_points:float, rev_boxes:int):
         self.box=float(box_points); self.rev=int(rev_boxes)
         self.anchor=None; self.dir=0; self.brick_id=0
+    def reanchor(self, px:float):
+        self.anchor = px; self.dir = 0
     def feed_price(self, px:float):
         created=[]
         if self.anchor is None:
@@ -151,6 +140,8 @@ class StrategyState:
         # debounce direcional (apenas ENTRADAS)
         self.last_brick_id=None
         self.last_side=None  # "BUY" / "SELL"
+        # trava reversão no mesmo brick
+        self.stop_brick_id=None
     def update_indics(self, x:float):
         return self.ema_fast.update(x), self.ema_slow.update(x), self.rsi.update(x)
 
@@ -190,24 +181,69 @@ def show_pnl():
     except Exception as e:
         print(f"{YELLOW}⚠️ Erro ao obter PnL:{RESET}", e)
 
-# ---------- ordens ----------
+# ---------- ordens (com confirmação e tratamento de erro) ----------
+def _position_snapshot():
+    try:
+        d = client.get_position_risk(symbol=SYMBOL)
+        if d:
+            p=d[0]; return float(p.get("positionAmt",0.0))
+    except Exception:
+        pass
+    return 0.0
+
 def market_order(side:str, qty:float, reduce_only:bool=False):
+    """
+    Envia ordem; trata erro -2019 (margem) e confirma alteração de posição.
+    Retorna True somente se a posição mudar de fato (para entradas) ou reduzir (para STOP).
+    """
     global client
     params=dict(symbol=SYMBOL, side=side, type="MARKET", quantity=qty)
     if reduce_only: params["reduceOnly"]="true"
+
+    before_amt = _position_snapshot()
     try:
-        client.new_order(**params)
-    except Exception:
+        resp = client.new_order(**params)
+        # algumas libs não retornam code/msg no sucesso; se vier, checar
+        if isinstance(resp, dict) and resp.get("code"):
+            print(f"{RED}❌ Binance recusou: {resp.get('code')} {resp.get('msg')}{RESET}")
+            return False
+    except Exception as e:
+        # tenta relogar e reenviar uma vez
         try:
             print(f"{YELLOW}⚠️ Sessão pode ter expirado. Recriando client e reenviando…{RESET}")
             client = get_client()
-            client.new_order(**params)
+            resp = client.new_order(**params)
+            if isinstance(resp, dict) and resp.get("code"):
+                print(f"{RED}❌ Binance recusou: {resp.get('code')} {resp.get('msg')}{RESET}")
+                return False
         except Exception as e2:
-            print(f"{RED}❌ Erro ao enviar ordem:{RESET}", e2)
+            # mensagens típicas de margem insuficiente
+            msg = str(e2)
+            if "Margin is insufficient" in msg or "-2019" in msg:
+                print(f"{RED}❌ Erro ao enviar ordem: Margin is insufficient (-2019).{RESET}")
+            else:
+                print(f"{RED}❌ Erro ao enviar ordem:{RESET}", e2)
             return False
-    print(f"{GREEN}✅ Ordem {side} qty={qty} reduceOnly={reduce_only}{RESET}")
-    time.sleep(0.2); show_pnl()
-    return True
+
+    # confirmação simples: aguarda um pouco e confere posição
+    for _ in range(5):
+        time.sleep(0.15)
+        after_amt = _position_snapshot()
+        if reduce_only:
+            # para stop, basta que a posição tenha se aproximado de zero (ou mudado)
+            if abs(after_amt) <= max(abs(before_amt) - 1e-9, 0.0) or (before_amt!=0 and after_amt==0):
+                print(f"{GREEN}✅ Ordem {side} qty={qty} reduceOnly={reduce_only}{RESET}")
+                show_pnl()
+                return True
+        else:
+            # para entrada, checa se direção/quantidade mudaram
+            if abs(after_amt - before_amt) > 1e-9:
+                print(f"{GREEN}✅ Ordem {side} qty={qty} reduceOnly={reduce_only}{RESET}")
+                show_pnl()
+                return True
+
+    print(f"{YELLOW}⚠️ Ordem enviada mas não confirmou alteração de posição.{RESET}")
+    return False
 
 # ---------- extração de preço (robusta) ----------
 def _first_number(*vals):
@@ -268,21 +304,31 @@ def apply_logic_on_brick(state:StrategyState, brick_close:float, d:int, brick_id
     def dup_block(side:str)->bool:
         return (state.last_brick_id == brick_id) and (state.last_side == side)
 
-    # STOPs (não marcam last_side → permitem reversão no mesmo brick)
-    if state.in_long and renkoVermelh and market_order("SELL", qty, True):
-        print(f"{YELLOW}🛑 STOP COMPRA #{brick_id} @ {brick_close:.2f}{RESET}")
-        state.in_long = False
-        state.last_brick_id = brick_id
+    # ---- STOPs (bloqueiam reversão no mesmo brick) ----
+    did_stop = False
+    if state.in_long and renkoVermelh:
+        if market_order("SELL", qty, True):
+            print(f"{YELLOW}🛑 STOP COMPRA #{brick_id} @ {brick_close:.2f}{RESET}")
+            state.in_long = False
+            state.stop_brick_id = brick_id
+            did_stop = True
 
-    if state.in_short and renkoVerde and market_order("BUY", qty, True):
-        print(f"{YELLOW}🛑 STOP VENDA  #{brick_id} @ {brick_close:.2f}{RESET}")
-        state.in_short = False
-        state.last_brick_id = brick_id
+    if state.in_short and renkoVerde:
+        if market_order("BUY", qty, True):
+            print(f"{YELLOW}🛑 STOP VENDA  #{brick_id} @ {brick_close:.2f}{RESET}")
+            state.in_short = False
+            state.stop_brick_id = brick_id
+            did_stop = True
 
-    # Entradas
+    # se houve STOP, não permite reversão no mesmo brick
+    if did_stop:
+        return
+
+    # ---- Entradas (com debounce direcional) ----
     long_ok  = renkoVerde   and (e1 > e2) and (RSI_WIN_LONG[0]  <= rsi <= RSI_WIN_LONG[1]) and not state.in_long
     short_ok = renkoVermelh and (e1 < e2) and (RSI_WIN_SHORT[0] <= rsi <= RSI_WIN_SHORT[1]) and not state.in_short
 
+    # impede duas entradas iguais no mesmo brick
     if long_ok and not dup_block("BUY"):
         if market_order("BUY", qty):
             print(f"{GREEN}🚀 COMPRA #{brick_id} @ {brick_close:.2f}{RESET}")
@@ -304,20 +350,23 @@ def warmup_state(state:StrategyState, renko:RenkoEngine):
         if not kl:
             print(f"{YELLOW}⚠️ Warm-up: sem klines retornados.{RESET}")
             return
-        bricks_before = renko.brick_id
-        for i, row in enumerate(kl):
+        for row in kl:
             close = float(row[4])  # kline[4] = close
             for brick_close, d, brick_id in renko.feed_price(close):
-                e1,e2,rsi = state.update_indics(brick_close)
-                if WARMUP_LOG_EVERY and brick_id % WARMUP_LOG_EVERY == 0:
-                    print(f"{GRAY}↺ Warm-up: brick {brick_id} close={brick_close:.2f} | EMA9={e1:.2f} EMA21={e2:.2f}{RESET}")
-        formed = renko.brick_id - bricks_before
-        anchor = renko.anchor
-        print(f"{CYAN}🧰 Warm-up concluído: {formed} bricks formados | anchor={anchor:.2f} | base={WARMUP_INTERVAL} x {WARMUP_LIMIT}{RESET}")
+                state.update_indics(brick_close)
+        if REANCHOR_AFTER_WARMUP:
+            # reancora no preço atual para evitar “entradas do passado”
+            try:
+                px = float(client.ticker_price(symbol=SYMBOL)['price'])
+                renko.reanchor(px)
+            except Exception:
+                pass
+        formed = renko.brick_id
+        print(f"{CYAN}🧰 Warm-up concluído: {formed} bricks (para EMA/RSI) | anchor reancorado no preço atual{RESET}")
     except Exception as e:
         print(f"{YELLOW}⚠️ Warm-up falhou:{RESET}", e)
 
-# ---------- loop WS + fallback + TELEMETRIA ----------
+# ---------- loop WS + fallback ----------
 def run_ws():
     setup_symbol()
     while True:
@@ -329,38 +378,16 @@ def run_ws():
 
         ws = UMFuturesWebsocketClient()
         last_tick_ts = time.time()
-        ws_msg_count = {"total": 0}
 
-        # feeder via WS (com telemetria)
+        # feeder via WS
         def on_msg(_, message):
             nonlocal last_tick_ts
             try:
-                ws_msg_count["total"] += 1
-                if TELEMETRY_FULL:
-                    # Mostra origem quando possível
-                    origin = "?"
-                    try:
-                        if isinstance(message, str):
-                            m = json.loads(message)
-                        else:
-                            m = message
-                        if isinstance(m, dict):
-                            if m.get("e") == "aggTrade" or "a" in m and "p" in m:
-                                origin = "aggTrade"
-                            elif m.get("e") == "markPriceUpdate":
-                                origin = "markPrice"
-                    except Exception:
-                        pass
-                    print(f"{GRAY}🛰️ WS[{ws_msg_count['total']}] {ts()} | origem={origin} | bytes≈{len(preview(message))} | {preview(message)}{RESET}")
-
                 px = extract_price(message)
                 if px > 0:
                     last_tick_ts = time.time()
                     for brick_close, d, brick_id in renko.feed_price(px):
                         apply_logic_on_brick(state, brick_close, d, brick_id, source="WS")
-                else:
-                    if TELEMETRY_FULL:
-                        print(f"{YELLOW}⛔ Tick ignorado (sem preço válido) | {preview(message)}{RESET}")
             except Exception as e:
                 print(f"{YELLOW}⚠️ on_msg error:{RESET}", e)
                 traceback.print_exc()
@@ -372,20 +399,16 @@ def run_ws():
                 time.sleep(HTTP_FALLBACK_INTERVAL_S)
                 if not HTTP_FALLBACK:
                     continue
-                silence = time.time() - last_tick_ts
-                if silence < HTTP_FALLBACK_AFTER_S:
-                    continue  # WS está saudável
+                if time.time() - last_tick_ts < HTTP_FALLBACK_AFTER_S:
+                    continue
                 try:
                     px = float(client.ticker_price(symbol=SYMBOL)['price'])
-                    if TELEMETRY_FULL:
-                        print(f"{GRAY}🌐 HTTP {ts()} | silêncio WS={silence:.2f}s | px={px}{RESET}")
                     for brick_close, d, brick_id in renko.feed_price(px):
                         apply_logic_on_brick(state, brick_close, d, brick_id, source="HTTP")
                 except Exception:
-                    # ignora erro momentâneo
                     pass
 
-        # heartbeat (pode ser silenciado)
+        # heartbeat (silencioso por padrão)
         def heartbeat():
             while not stop_flag["stop"]:
                 time.sleep(HEARTBEAT_S)
@@ -393,7 +416,7 @@ def run_ws():
                     ws.ping()
                     if not SILENT_HEARTBEAT:
                         uptime = round(time.time()-start_ts,1)
-                        print(f"{MAGENTA}💓 Heartbeat (ping {HEARTBEAT_S}s) | Uptime {uptime}s | WS_msgs={ws_msg_count['total']}{RESET}")
+                        print(f"{MAGENTA}💓 Heartbeat (ping {HEARTBEAT_S}s) | Uptime {uptime}s{RESET}")
                 except Exception:
                     break
 
@@ -428,7 +451,7 @@ def run_ws():
             try: ws.stop()
             except Exception: pass
 
-        stop_flag["stop"] = True  # encerra heartbeat/feeder antes de reconectar
+        stop_flag["stop"] = True
         print(f"{CYAN}⚡ Reabrindo WS agora… (instantâneo){RESET}")
         time.sleep(0.1)
 
