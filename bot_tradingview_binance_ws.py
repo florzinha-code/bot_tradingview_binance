@@ -3,11 +3,11 @@
 # ✅ Warm-up de histórico (EMA/RSI estáveis) + reancoragem no preço atual
 # ✅ PnL detalhado (USDT + %)
 # ✅ Reconexão instantânea + watchdog
-# ✅ Heartbeat 30s (silencioso por padrão)
-# ✅ Debounce direcional (impede duas entradas iguais no mesmo brick)
-# ✅ STOP sem reversão no mesmo brick (reversão só no próximo brick)
+# ✅ Sem “ping-ping” no log (sem heartbeat manual)
+# ✅ Debounce direcional (impede duas ENTRADAS iguais no mesmo brick)
+# ✅ STOP + reversão permitidos no mesmo brick
 # ✅ Auto-relogin (recria UMFutures em erro)
-# ✅ Streams duplos (aggTrade + markPrice) + Fallback HTTP (ticker_price)
+# ✅ Streams (aggTrade + markPrice quando disponível) + Fallback HTTP discreto
 # ✅ Logs enxutos (1 linha por brick + ordens)
 
 import os, time, json, traceback, functools, threading, datetime as dt
@@ -35,21 +35,17 @@ RSI_WIN_LONG = (40.0, 65.0)
 RSI_WIN_SHORT= (35.0, 60.0)
 MIN_QTY      = 0.001
 
-# Robustez
-NO_TICK_RESTART_S = 90     # watchdog do WS
-HEARTBEAT_S       = 30     # ping silencioso
-SILENT_HEARTBEAT  = True
-
-# Fallback HTTP
-HTTP_FALLBACK            = True
-HTTP_FALLBACK_AFTER_S    = 2.0
-HTTP_FALLBACK_INTERVAL_S = 0.5
+# Robustez (sem flood)
+NO_TICK_RESTART_S       = 120      # watchdog do WS (se ficar mudo por >120s, reconecta)
+HTTP_FALLBACK           = True
+HTTP_FALLBACK_AFTER_S   = 2.0      # se WS ficar >2s sem tick, ativa HTTP feeder
+HTTP_FALLBACK_INTERVAL  = 0.6      # frequência do feeder HTTP (discreto)
 
 # Warm-up
-WARMUP_ENABLED   = True
-WARMUP_INTERVAL  = "1m"
-WARMUP_LIMIT     = 1000
-REANCHOR_AFTER_WARMUP = True   # <- reancora no preço atual ao final do warm-up
+WARMUP_ENABLED          = True
+WARMUP_INTERVAL         = "1m"
+WARMUP_LIMIT            = 1000
+REANCHOR_AFTER_WARMUP   = True     # reancora no preço atual ao final do warm-up
 
 API_KEY    = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
@@ -137,11 +133,9 @@ class StrategyState:
         self.in_long=False; self.in_short=False
         self.ema_fast=EMA(EMA_FAST); self.ema_slow=EMA(EMA_SLOW)
         self.rsi=RSI_Wilder(RSI_LEN)
-        # debounce direcional (apenas ENTRADAS)
+        # debounce direcional (apenas ENTRADAS; STOP não marca → permite STOP + reversão no mesmo brick)
         self.last_brick_id=None
-        self.last_side=None  # "BUY" / "SELL"
-        # trava reversão no mesmo brick
-        self.stop_brick_id=None
+        self.last_side=None      # "BUY" / "SELL"
     def update_indics(self, x:float):
         return self.ema_fast.update(x), self.ema_slow.update(x), self.rsi.update(x)
 
@@ -181,7 +175,7 @@ def show_pnl():
     except Exception as e:
         print(f"{YELLOW}⚠️ Erro ao obter PnL:{RESET}", e)
 
-# ---------- ordens (com confirmação e tratamento de erro) ----------
+# ---------- posição snapshot ----------
 def _position_snapshot():
     try:
         d = client.get_position_risk(symbol=SYMBOL)
@@ -191,6 +185,7 @@ def _position_snapshot():
         pass
     return 0.0
 
+# ---------- ordens (com confirmação e relogin) ----------
 def market_order(side:str, qty:float, reduce_only:bool=False):
     """
     Envia ordem; trata erro -2019 (margem) e confirma alteração de posição.
@@ -203,12 +198,10 @@ def market_order(side:str, qty:float, reduce_only:bool=False):
     before_amt = _position_snapshot()
     try:
         resp = client.new_order(**params)
-        # algumas libs não retornam code/msg no sucesso; se vier, checar
         if isinstance(resp, dict) and resp.get("code"):
             print(f"{RED}❌ Binance recusou: {resp.get('code')} {resp.get('msg')}{RESET}")
             return False
-    except Exception as e:
-        # tenta relogar e reenviar uma vez
+    except Exception:
         try:
             print(f"{YELLOW}⚠️ Sessão pode ter expirado. Recriando client e reenviando…{RESET}")
             client = get_client()
@@ -217,7 +210,6 @@ def market_order(side:str, qty:float, reduce_only:bool=False):
                 print(f"{RED}❌ Binance recusou: {resp.get('code')} {resp.get('msg')}{RESET}")
                 return False
         except Exception as e2:
-            # mensagens típicas de margem insuficiente
             msg = str(e2)
             if "Margin is insufficient" in msg or "-2019" in msg:
                 print(f"{RED}❌ Erro ao enviar ordem: Margin is insufficient (-2019).{RESET}")
@@ -225,18 +217,16 @@ def market_order(side:str, qty:float, reduce_only:bool=False):
                 print(f"{RED}❌ Erro ao enviar ordem:{RESET}", e2)
             return False
 
-    # confirmação simples: aguarda um pouco e confere posição
-    for _ in range(5):
+    # confirmação simples
+    for _ in range(6):
         time.sleep(0.15)
         after_amt = _position_snapshot()
         if reduce_only:
-            # para stop, basta que a posição tenha se aproximado de zero (ou mudado)
             if abs(after_amt) <= max(abs(before_amt) - 1e-9, 0.0) or (before_amt!=0 and after_amt==0):
                 print(f"{GREEN}✅ Ordem {side} qty={qty} reduceOnly={reduce_only}{RESET}")
                 show_pnl()
                 return True
         else:
-            # para entrada, checa se direção/quantidade mudaram
             if abs(after_amt - before_amt) > 1e-9:
                 print(f"{GREEN}✅ Ordem {side} qty={qty} reduceOnly={reduce_only}{RESET}")
                 show_pnl()
@@ -296,39 +286,35 @@ def apply_logic_on_brick(state:StrategyState, brick_close:float, d:int, brick_id
     renkoVerde   = (d== 1)
     renkoVermelh = (d==-1)
 
-    # 1 linha por brick + origem do tick
-    print(f"{MAGENTA}{'🛰️WS' if source=='WS' else '🌐HTTP'} | "
-          f"{ts()} | 🧱 {brick_id} {'▲' if renkoVerde else '▼'} | close={brick_close:.2f} "
+    # 1 linha por brick + origem
+    print(f"{MAGENTA}{'WS' if source=='WS' else 'HTTP'} {ts()} | "
+          f"🧱 {brick_id} {'▲' if renkoVerde else '▼'} | close={brick_close:.2f} "
           f"| EMA9={e1:.2f} EMA21={e2:.2f} | RSI={rsi:.2f}{RESET}")
 
     def dup_block(side:str)->bool:
         return (state.last_brick_id == brick_id) and (state.last_side == side)
 
-    # ---- STOPs (bloqueiam reversão no mesmo brick) ----
-    did_stop = False
+    # ---- STOPs (não gravam last_side → permitem reversão no mesmo brick) ----
+    did_stop_long = False
+    did_stop_short= False
+
     if state.in_long and renkoVermelh:
         if market_order("SELL", qty, True):
             print(f"{YELLOW}🛑 STOP COMPRA #{brick_id} @ {brick_close:.2f}{RESET}")
             state.in_long = False
-            state.stop_brick_id = brick_id
-            did_stop = True
+            did_stop_long = True
 
     if state.in_short and renkoVerde:
         if market_order("BUY", qty, True):
             print(f"{YELLOW}🛑 STOP VENDA  #{brick_id} @ {brick_close:.2f}{RESET}")
             state.in_short = False
-            state.stop_brick_id = brick_id
-            did_stop = True
+            did_stop_short = True
 
-    # se houve STOP, não permite reversão no mesmo brick
-    if did_stop:
-        return
-
-    # ---- Entradas (com debounce direcional) ----
+    # ---- Entradas (permite reversão no MESMO brick se as condições baterem) ----
     long_ok  = renkoVerde   and (e1 > e2) and (RSI_WIN_LONG[0]  <= rsi <= RSI_WIN_LONG[1]) and not state.in_long
     short_ok = renkoVermelh and (e1 < e2) and (RSI_WIN_SHORT[0] <= rsi <= RSI_WIN_SHORT[1]) and not state.in_short
 
-    # impede duas entradas iguais no mesmo brick
+    # Se parou LONG e virou vermelho, pode abrir SHORT neste mesmo brick (e vice-versa)
     if long_ok and not dup_block("BUY"):
         if market_order("BUY", qty):
             print(f"{GREEN}🚀 COMPRA #{brick_id} @ {brick_close:.2f}{RESET}")
@@ -355,18 +341,17 @@ def warmup_state(state:StrategyState, renko:RenkoEngine):
             for brick_close, d, brick_id in renko.feed_price(close):
                 state.update_indics(brick_close)
         if REANCHOR_AFTER_WARMUP:
-            # reancora no preço atual para evitar “entradas do passado”
             try:
                 px = float(client.ticker_price(symbol=SYMBOL)['price'])
                 renko.reanchor(px)
             except Exception:
                 pass
         formed = renko.brick_id
-        print(f"{CYAN}🧰 Warm-up concluído: {formed} bricks (para EMA/RSI) | anchor reancorado no preço atual{RESET}")
+        print(f"{CYAN}🧰 Warm-up concluído: {formed} bricks (EMA/RSI estáveis) | anchor reancorado no preço atual{RESET}")
     except Exception as e:
         print(f"{YELLOW}⚠️ Warm-up falhou:{RESET}", e)
 
-# ---------- loop WS + fallback ----------
+# ---------- loop WS + fallback (sem heartbeat manual) ----------
 def run_ws():
     setup_symbol()
     while True:
@@ -376,10 +361,10 @@ def run_ws():
         # warm-up Renko/indicadores com histórico recente
         warmup_state(state, renko)
 
-        ws = UMFuturesWebsocketClient()
+        ws = UMFuturesWebsocketClient()  # usa ping/pong internos do client (sem logs)
         last_tick_ts = time.time()
 
-        # feeder via WS
+        # feeder via WS (aggTrade + markPrice se disponível)
         def on_msg(_, message):
             nonlocal last_tick_ts
             try:
@@ -392,33 +377,21 @@ def run_ws():
                 print(f"{YELLOW}⚠️ on_msg error:{RESET}", e)
                 traceback.print_exc()
 
-        # feeder HTTP fallback (liga quando WS fica mudo)
+        # fallback HTTP (entra somente em silêncio real do WS)
         stop_flag = {"stop": False}
         def http_feeder():
             while not stop_flag["stop"]:
-                time.sleep(HTTP_FALLBACK_INTERVAL_S)
+                time.sleep(HTTP_FALLBACK_INTERVAL)
                 if not HTTP_FALLBACK:
                     continue
                 if time.time() - last_tick_ts < HTTP_FALLBACK_AFTER_S:
-                    continue
+                    continue  # WS está saudável
                 try:
                     px = float(client.ticker_price(symbol=SYMBOL)['price'])
                     for brick_close, d, brick_id in renko.feed_price(px):
                         apply_logic_on_brick(state, brick_close, d, brick_id, source="HTTP")
                 except Exception:
                     pass
-
-        # heartbeat (silencioso por padrão)
-        def heartbeat():
-            while not stop_flag["stop"]:
-                time.sleep(HEARTBEAT_S)
-                try:
-                    ws.ping()
-                    if not SILENT_HEARTBEAT:
-                        uptime = round(time.time()-start_ts,1)
-                        print(f"{MAGENTA}💓 Heartbeat (ping {HEARTBEAT_S}s) | Uptime {uptime}s{RESET}")
-                except Exception:
-                    break
 
         start_ts = time.time()
         try:
@@ -430,18 +403,18 @@ def run_ws():
                 ws.mark_price(symbol=SYMBOL.lower(), id=2, callback=on_msg)
             except Exception:
                 pass
-            threading.Thread(target=heartbeat, daemon=True).start()
             threading.Thread(target=http_feeder, daemon=True).start()
             print(f"{BLUE}▶️ WS ativo para {SYMBOL}. Aguardando bricks…{RESET}")
         except Exception as e:
             print(f"{RED}❌ Erro ao abrir WS:{RESET}", e)
 
+        # watchdog de silêncio (sem prints periódicos)
         try:
             while True:
                 time.sleep(5)
                 silence = time.time() - last_tick_ts
                 if silence > NO_TICK_RESTART_S:
-                    print(f"{YELLOW}⏱️ {silence:.1f}s sem tick WS (limite {NO_TICK_RESTART_S}s). Reiniciando WS…{RESET}")
+                    print(f"{YELLOW}⏱️ {silence:.1f}s sem tick WS. Reiniciando WS…{RESET}")
                     try: ws.stop()
                     except Exception: pass
                     break
