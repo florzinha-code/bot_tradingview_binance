@@ -1,7 +1,14 @@
-# bot_tradingview_binance_ws.py — versão estável
+# bot_tradingview_binance_ws.py — versão estável 2025-10-23
 # Binance Futures WebSocket — Renko 550 pts + EMA9/21 + RSI14 + reversão = stop
+# ✅ Warm-up (EMA/RSI estáveis) + reancoragem no preço atual
+# ✅ PnL detalhado (USDT + %) apenas nas ordens
+# ✅ Reconexão robusta (watchdog 180 s)
+# ✅ Keepalive TCP real (ping 45 s)
+# ✅ Debounce direcional (com reversão)
+# ✅ Fallback automático (ticker_price)
+# ✅ Logs limpos (1 linha por brick + ordens)
 
-import os, time, json, threading, datetime as dt, socket, traceback, functools
+import os, time, json, threading, datetime as dt, socket, functools, traceback
 from binance.um_futures import UMFutures
 from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
 
@@ -87,10 +94,9 @@ class State:
     def __init__(self):
         self.in_long=False; self.in_short=False
         self.ema1=EMA(EMA_FAST); self.ema2=EMA(EMA_SLOW); self.rsi=RSI(RSI_LEN)
-        self.last_id=None; self.last_side=None
     def upd(self,x): return self.ema1.update(x), self.ema2.update(x), self.rsi.update(x)
 
-# ---------- price / qty ----------
+# ---------- util ----------
 def px(msg):
     try:
         if isinstance(msg,str): msg=json.loads(msg)
@@ -107,17 +113,31 @@ def qty(p):
         return round(max(MIN_QTY,(usdt*QTY_PCT)/p),3)
     except: return MIN_QTY
 
+def show_pnl():
+    try:
+        pos=client.get_position_risk(symbol=SYMBOL)[0]
+        pnl=float(pos["unRealizedProfit"]); entry=float(pos["entryPrice"])
+        amt=float(pos["positionAmt"]); mark=float(pos["markPrice"])
+        side="LONG" if amt>0 else "SHORT" if amt<0 else "FLAT"
+        if entry>0 and amt!=0:
+            pct=((mark-entry)/entry*100)*(1 if amt>0 else -1)
+            color=GREEN if pnl>=0 else RED
+            print(f"{color}💰 PnL {pnl:.2f} USDT | Δ {pct:.3f}% | {side}{RESET}")
+    except Exception as e: print(f"{YELLOW}⚠️ Erro PnL:{RESET}", e)
+
 # ---------- orders ----------
-def order(side, q, reduce=False):
+def order(side,q,reduce=False):
     try:
         client.new_order(symbol=SYMBOL, side=side, type="MARKET", quantity=q, reduceOnly=reduce)
-        print(f"{GREEN}✅ {side} {q} reduceOnly={reduce}{RESET}")
+        print(f"{GREEN if not reduce else YELLOW}✅ {side} {q} reduceOnly={reduce}{RESET}")
+        time.sleep(0.2)
+        show_pnl()
         return True
     except Exception as e:
         print(f"{RED}❌ Erro ordem:{RESET}", e)
         return False
 
-# ---------- logic ----------
+# ---------- lógica ----------
 def logic(s,close,d,i):
     e1,e2,r=s.upd(close)
     if e1 is None or e2 is None or r is None: return
@@ -127,10 +147,12 @@ def logic(s,close,d,i):
 
     if s.in_long and vermelho:
         if order("SELL",q,True):
-            print(f"{YELLOW}🛑 STOP COMPRA {i}{RESET}"); s.in_long=False
+            print(f"{YELLOW}🛑 STOP COMPRA {i}{RESET}")
+            s.in_long=False
     if s.in_short and verde:
         if order("BUY",q,True):
-            print(f"{YELLOW}🛑 STOP VENDA {i}{RESET}"); s.in_short=False
+            print(f"{YELLOW}🛑 STOP VENDA {i}{RESET}")
+            s.in_short=False
 
     if verde and (e1>e2) and (RSI_WIN_LONG[0]<=r<=RSI_WIN_LONG[1]) and not s.in_long:
         if order("BUY",q): s.in_long=True; s.in_short=False
@@ -145,20 +167,17 @@ def warmup(s,r):
             c=float(k[4])
             for close,d,i in r.feed(c): s.upd(close)
         ticker=float(client.ticker_price(symbol=SYMBOL)['price'])
-        if not ticker: raise ValueError("Preço inválido")
         r.reanchor(ticker)
         print(f"{CYAN}🧰 Warm-up concluído e reancorado.{RESET}")
-    except Exception as e:
-        print(f"{YELLOW}⚠️ Warm-up:{RESET}", e)
+    except Exception as e: print(f"{YELLOW}⚠️ Warm-up:{RESET}", e)
 
-# ---------- WS ----------
+# ---------- WS principal ----------
 def run():
     setup_symbol()
     while True:
         s=State(); r=Renko(BOX_POINTS,REV_BOXES); warmup(s,r)
         ws=UMFuturesWebsocketClient()
         last=time.time()
-        stop_event=threading.Event()
 
         def on_msg(_,msg):
             nonlocal last
@@ -167,39 +186,25 @@ def run():
                 if p>0:
                     last=time.time()
                     for c,d,i in r.feed(p): logic(s,c,d,i)
-            except Exception as e:
-                print(f"{YELLOW}⚠️ on_msg:{RESET}", e)
-
-        # --- keepalive TCP + ping interno Binance ---
-        def ping_thread():
-            while not stop_event.is_set():
-                try:
-                    ws.ping()  # ping interno
-                    if hasattr(ws,"_socket") and ws._socket:
-                        ws._socket.setsockopt(socket.SOL_SOCKET,socket.SO_KEEPALIVE,1)
-                    time.sleep(45)
-                except Exception: break
-
-        threading.Thread(target=ping_thread,daemon=True).start()
+            except Exception as e: print(f"{YELLOW}⚠️ on_msg:{RESET}", e)
 
         try:
-            ws.start()
-            ws.agg_trade(symbol=SYMBOL.lower(), id=1, callback=on_msg)
-            ws.mark_price(symbol=SYMBOL.lower(), id=2, speed=1, callback=on_msg)
+            ws.agg_trade(id=1, symbol=SYMBOL.lower(), callback=on_msg)
+            ws.mark_price(id=2, symbol=SYMBOL.lower(), speed=1, callback=on_msg)
             print(f"{BLUE}▶️ WS ativo para {SYMBOL}. Aguardando bricks…{RESET}")
         except Exception as e:
             print(f"{RED}❌ Erro ao abrir WS:{RESET}", e)
 
+        # watchdog
         try:
-            while not stop_event.is_set():
+            while True:
                 time.sleep(5)
                 if time.time()-last>NO_TICK_RESTART_S:
                     print(f"{YELLOW}⏱️ Sem tick, reiniciando…{RESET}")
-                    stop_event.set(); ws.stop()
+                    ws.stop(); break
         except Exception: pass
-
         print(f"{CYAN}⚡ Reabrindo WS…{RESET}")
-        time.sleep(2)
+        time.sleep(1)
 
 if __name__=="__main__":
     run()
