@@ -346,7 +346,7 @@ def run_ws():
                 try:
                     ws.ping()
                     # uptime = round(time.time() - start_ts, 1)
-                    # print(f"{MAGENTA}💓 Heartbeat enviado (ping {HEARTBEAT_S}s) | Uptime: {uptime}s{RESET}")
+                    # print(f"{MAGENTA}💓 Heartbeat mod enviado (ping {HEARTBEAT_S}s) | Uptime: {uptime}s{RESET}")
                 except Exception:
                     break
 
