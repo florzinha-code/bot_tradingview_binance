@@ -1,4 +1,4 @@
-# bot_tradingview_binance_ws.py — FINAL
+# bot_tradingview_binance_ws.py — COMBAT READY
 # Binance Futures — Renko 550 pts + EMA9/21 + RSI14
 # - Warm-up (EMA/RSI estáveis) + reancoragem no preço atual
 # - PnL detalhado só nas ordens
@@ -6,11 +6,13 @@
 # - Reconexão robusta (watchdog 180s)
 # - Keepalive real: ping WS 45s + TCP keepalive
 # - Fallback HTTP (ticker_price) se WS ficar mudo > 2s
-# - Logs: 1 linha por tijolo + ordens
+# - Logs limpos: 1 linha por tijolo + ordens
 
-import os, time, json, threading, datetime as dt, socket, functools, traceback
+import os, time, json, threading, datetime as dt, socket, functools, warnings
 from binance.um_futures import UMFutures
 from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
+
+warnings.filterwarnings("ignore", category=SyntaxWarning)
 
 # ---------- estilo ----------
 RESET="\033[0m"; RED="\033[91m"; GREEN="\033[92m"; YELLOW="\033[93m"
@@ -31,10 +33,9 @@ RSI_WIN_LONG  = (40.0, 65.0)
 RSI_WIN_SHORT = (35.0, 60.0)
 MIN_QTY = 0.001
 
-# robustez
-NO_TICK_RESTART_S       = 180        # watchdog
-HTTP_FALLBACK_AFTER_S   = 2.0        # se WS ficar mudo > 2s, liga HTTP feeder
-HTTP_FALLBACK_INTERVAL  = 0.5
+NO_TICK_RESTART_S      = 180
+HTTP_FALLBACK_AFTER_S  = 2.0
+HTTP_FALLBACK_INTERVAL = 0.5
 
 API_KEY    = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
@@ -92,11 +93,11 @@ class Renko:
         up=self.anchor+self.box; dn=self.anchor-self.box
         while px>=up:
             self.anchor += self.box if self.dir!=-1 else self.box*self.rev
-            self.dir=1; self.id+=1; bricks.append((self.anchor, 1, self.id))
+            self.dir=1; self.id+=1; bricks.append((self.anchor,1,self.id))
             up=self.anchor+self.box; dn=self.anchor-self.box
         while px<=dn:
             self.anchor -= self.box if self.dir!=1 else self.box*self.rev
-            self.dir=-1; self.id+=1; bricks.append((self.anchor,-1, self.id))
+            self.dir=-1; self.id+=1; bricks.append((self.anchor,-1,self.id))
             up=self.anchor+self.box; dn=self.anchor-self.box
         return bricks
 
@@ -105,9 +106,7 @@ class State:
     def __init__(self):
         self.in_long=False; self.in_short=False
         self.ema1=EMA(EMA_FAST); self.ema2=EMA(EMA_SLOW); self.rsi=RSI(RSI_LEN)
-        # debounce de ENTRADA (evita repetir a MESMA direção no MESMO brick)
-        self.last_entry_brick=None
-        self.last_entry_side=None  # "BUY"/"SELL"
+        self.last_entry_brick=None; self.last_entry_side=None
     def upd(self, x): return self.ema1.update(x), self.ema2.update(x), self.rsi.update(x)
 
 # ---------- preço / qty ----------
@@ -116,8 +115,7 @@ def _first_number(*vals):
         try:
             if v is None: continue
             return float(v)
-        except Exception:
-            pass
+        except: pass
     return 0.0
 
 def extract_px(msg):
@@ -132,19 +130,17 @@ def extract_px(msg):
                     v=_first_number(sub.get("p"), sub.get("c"), sub.get("price"))
                     if v: return v
         return 0.0
-    except Exception:
-        return 0.0
+    except: return 0.0
 
 def calc_qty(p):
     try:
         bal=client.balance()
         usdt=float(next((b.get("balance") for b in bal if b.get("asset")=="USDT"), 0.0))
-        q = (usdt*QTY_PCT)/max(p,1e-9)
+        q=(usdt*QTY_PCT)/max(p,1e-9)
         return max(MIN_QTY, round(q,3))
-    except Exception:
-        return MIN_QTY
+    except: return MIN_QTY
 
-# ---------- PnL (só em ordens) ----------
+# ---------- PnL ----------
 def show_pnl():
     try:
         d=client.get_position_risk(symbol=SYMBOL)
@@ -162,178 +158,119 @@ def show_pnl():
 
 # ---------- ordens ----------
 def market_order(side, q, reduce=False):
+    global client
     try:
         params=dict(symbol=SYMBOL, side=side, type="MARKET", quantity=q)
         if reduce: params["reduceOnly"]="true"
         client.new_order(**params)
-        tag = (YELLOW if reduce else GREEN)
+        tag=(YELLOW if reduce else GREEN)
         print(f"{tag}✅ {side} qty={q} reduceOnly={reduce}{RESET}")
-        time.sleep(0.2)
-        show_pnl()
-        return True
+        time.sleep(0.2); show_pnl(); return True
     except Exception as e:
-        # tenta recriar sessão 1x
         try:
             print(f"{YELLOW}⚠️ Recriando sessão e reenviando…{RESET}")
-            global client
-            client = get_client()
-            params=dict(symbol=SYMBOL, side=side, type="MARKET", quantity=q)
-            if reduce: params["reduceOnly"]="true"
+            client=get_client()
             client.new_order(**params)
             print(f"{GREEN}✅ {side} qty={q} reduceOnly={reduce}{RESET}")
-            time.sleep(0.2); show_pnl()
-            return True
+            time.sleep(0.2); show_pnl(); return True
         except Exception as e2:
             msg=str(e2)
             if "-2019" in msg or "Margin is insufficient" in msg:
                 print(f"{RED}❌ Ordem recusada: margem insuficiente (-2019).{RESET}")
-            else:
-                print(f"{RED}❌ Erro ordem:{RESET}", e2)
+            else: print(f"{RED}❌ Erro ordem:{RESET}", e2)
             return False
 
-# ---------- lógica por tijolo ----------
+# ---------- lógica ----------
 def on_brick(state, close, d, brick_id):
-    e1,e2,r = state.upd(close)
+    e1,e2,r=state.upd(close)
     if e1 is None or e2 is None or r is None: return
-
-    verde = (d== 1)
-    verm  = (d==-1)
+    verde=(d==1); verm=(d==-1)
     print(f"{MAGENTA}{ts()} | 🧱 {brick_id} {'▲' if verde else '▼'} | close={close:.2f} | EMA9={e1:.2f} EMA21={e2:.2f} | RSI={r:.2f}{RESET}")
-
-    q = calc_qty(close)
-
-    # 1) STOP (não grava debounce → permite reversão no MESMO tijolo)
+    q=calc_qty(close)
     if state.in_long and verm:
-        if market_order("SELL", q, True):
-            print(f"{YELLOW}🛑 STOP COMPRA #{brick_id} @ {close:.2f}{RESET}")
+        if market_order("SELL",q,True):
+            print(f"{YELLOW}🛑 STOP COMPRA #{brick_id}{RESET}")
             state.in_long=False
     if state.in_short and verde:
-        if market_order("BUY", q, True):
-            print(f"{YELLOW}🛑 STOP VENDA  #{brick_id} @ {close:.2f}{RESET}")
+        if market_order("BUY",q,True):
+            print(f"{YELLOW}🛑 STOP VENDA #{brick_id}{RESET}")
             state.in_short=False
+    def dup(s): return state.last_entry_brick==brick_id and state.last_entry_side==s
+    if verde and e1>e2 and RSI_WIN_LONG[0]<=r<=RSI_WIN_LONG[1] and not state.in_long and not dup("BUY"):
+        if market_order("BUY",q):
+            print(f"{GREEN}🚀 COMPRA #{brick_id}{RESET}")
+            state.in_long=True; state.in_short=False; state.last_entry_brick=brick_id; state.last_entry_side="BUY"
+    if verm and e1<e2 and RSI_WIN_SHORT[0]<=r<=RSI_WIN_SHORT[1] and not state.in_short and not dup("SELL"):
+        if market_order("SELL",q):
+            print(f"{CYAN}🔻 VENDA #{brick_id}{RESET}")
+            state.in_short=True; state.in_long=False; state.last_entry_brick=brick_id; state.last_entry_side="SELL"
 
-    # 2) ENTRADAS (debounce por brick/direção; permite stop+reversão no mesmo brick)
-    def dup(side): return (state.last_entry_brick==brick_id and state.last_entry_side==side)
-
-    long_ok  =  verde and (e1>e2) and (RSI_WIN_LONG[0]  <= r <= RSI_WIN_LONG[1])  and not state.in_long
-    short_ok =  verm  and (e1<e2) and (RSI_WIN_SHORT[0] <= r <= RSI_WIN_SHORT[1]) and not state.in_short
-
-    if long_ok and not dup("BUY"):
-        if market_order("BUY", q):
-            print(f"{GREEN}🚀 COMPRA #{brick_id} @ {close:.2f}{RESET}")
-            state.in_long=True; state.in_short=False
-            state.last_entry_brick=brick_id; state.last_entry_side="BUY"
-
-    if short_ok and not dup("SELL"):
-        if market_order("SELL", q):
-            print(f"{CYAN}🔻 VENDA  #{brick_id} @ {close:.2f}{RESET}")
-            state.in_short=True; state.in_long=False
-            state.last_entry_brick=brick_id; state.last_entry_side="SELL"
-
-# ---------- warm-up ----------
+# ---------- warmup ----------
 def warmup(state, renko):
     try:
-        kl = client.klines(symbol=SYMBOL, interval="1m", limit=500)
+        kl=client.klines(symbol=SYMBOL,interval="1m",limit=500)
         for k in kl:
-            close=float(k[4])
-            for brick_close, d, brick_id in renko.feed(close):
-                state.upd(brick_close)
-        # reancora no preço atual
-        try:
-            px = float(client.ticker_price(symbol=SYMBOL)['price'])
-            renko.reanchor(px)
-        except Exception:
-            pass
+            c=float(k[4])
+            for close,d,i in renko.feed(c): state.upd(close)
+        px=float(client.ticker_price(symbol=SYMBOL)['price'])
+        renko.reanchor(px)
         print(f"{CYAN}🧰 Warm-up concluído e reancorado.{RESET}")
-    except Exception as e:
-        print(f"{YELLOW}⚠️ Warm-up:{RESET}", e)
+    except Exception as e: print(f"{YELLOW}⚠️ Warm-up:{RESET}", e)
 
 # ---------- loop principal ----------
 def run():
     setup_symbol()
     while True:
-        state = State()
-        renko = Renko(BOX_POINTS, REV_BOXES)
-        warmup(state, renko)
+        state=State(); renko=Renko(BOX_POINTS,REV_BOXES); warmup(state,renko)
+        ws=UMFuturesWebsocketClient(); last_tick=time.time(); stop_ev=threading.Event()
 
-        ws = UMFuturesWebsocketClient()
-        last_tick = time.time()
-        stop_ev = threading.Event()
-
-        # feeder WS
-        def on_msg(_, message):
+        def on_msg(_,msg):
             nonlocal last_tick
             try:
-                p = extract_px(message)
-                if p > 0:
-                    last_tick = time.time()
-                    for c, d, i in renko.feed(p):
-                        on_brick(state, c, d, i)
-            except Exception as e:
-                print(f"{YELLOW}⚠️ on_msg:{RESET}", e)
+                p=extract_px(msg)
+                if p>0:
+                    last_tick=time.time()
+                    for c,d,i in renko.feed(p): on_brick(state,c,d,i)
+            except Exception as e: print(f"{YELLOW}⚠️ on_msg:{RESET}", e)
 
-        # ping de manutenção (WS + TCP keepalive)
         def keepalive():
             while not stop_ev.is_set():
                 try:
                     ws.ping()
-                    if hasattr(ws, "_socket") and ws._socket:
+                    if hasattr(ws,"_socket") and ws._socket:
                         try:
-                            ws._socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                            ws._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 45)
-                            ws._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 15)
-                            ws._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-                        except Exception:
-                            pass
-                except Exception:
-                    break
+                            ws._socket.setsockopt(socket.SOL_SOCKET,socket.SO_KEEPALIVE,1)
+                        except: pass
+                except: break
                 time.sleep(45)
 
-        # fallback HTTP se WS silenciar
         def http_fallback():
             while not stop_ev.is_set():
                 time.sleep(HTTP_FALLBACK_INTERVAL)
-                silence = time.time() - last_tick
-                if silence < HTTP_FALLBACK_AFTER_S:
-                    continue
+                if time.time()-last_tick<HTTP_FALLBACK_AFTER_S: continue
                 try:
-                    p = float(client.ticker_price(symbol=SYMBOL)['price'])
-                    for c, d, i in renko.feed(p):
-                        on_brick(state, c, d, i)
-                except Exception:
-                    pass
+                    p=float(client.ticker_price(symbol=SYMBOL)['price'])
+                    for c,d,i in renko.feed(p): on_brick(state,c,d,i)
+                except: pass
 
         try:
-            # assinaturas — cobre diferenças de versões do SDK
-            ws.agg_trade(id=1, symbol=SYMBOL.lower(), callback=on_msg)
-            try:
-                ws.mark_price(id=2, symbol=SYMBOL.lower(), speed=1, callback=on_msg)
-            except TypeError:
-                ws.mark_price(id=2, symbol=SYMBOL.lower(), callback=on_msg)
-
-            threading.Thread(target=keepalive, daemon=True).start()
-            threading.Thread(target=http_fallback, daemon=True).start()
+            ws.agg_trade(id=1,symbol=SYMBOL.lower(),callback=on_msg)
+            try: ws.mark_price(id=2,symbol=SYMBOL.lower(),speed=1,callback=on_msg)
+            except TypeError: ws.mark_price(id=2,symbol=SYMBOL.lower(),callback=on_msg)
+            threading.Thread(target=keepalive,daemon=True).start()
+            threading.Thread(target=http_fallback,daemon=True).start()
             print(f"{BLUE}▶️ WS ativo para {SYMBOL}. Aguardando bricks…{RESET}")
-        except Exception as e:
-            print(f"{RED}❌ Erro ao abrir WS:{RESET}", e)
+        except Exception as e: print(f"{RED}❌ Erro ao abrir WS:{RESET}", e)
 
-        # watchdog
         try:
             while True:
                 time.sleep(5)
-                if time.time() - last_tick > NO_TICK_RESTART_S:
+                if time.time()-last_tick>NO_TICK_RESTART_S:
                     print(f"{YELLOW}⏱️ Sem tick, reiniciando…{RESET}")
-                    stop_ev.set()
-                    try: ws.stop()
-                    except Exception: pass
-                    break
-        except Exception:
-            stop_ev.set()
-            try: ws.stop()
-            except Exception: pass
+                    stop_ev.set(); ws.stop(); break
+        except: stop_ev.set(); ws.stop()
 
         print(f"{CYAN}⚡ Reabrindo WS…{RESET}")
         time.sleep(1)
 
-if __name__ == "__main__":
-    run()
+if __name__=="__main__": run()
