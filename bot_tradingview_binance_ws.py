@@ -328,6 +328,7 @@ def run_ws():
             try:
                 px = extract_price(message)
                 if px > 0:
+                    print(f"=> Preco do px: ",px)
                     last_tick_ts = time.time()
                     for brick_close, d, brick_id in renko.feed_price(px):
                         print(f"{MAGENTA}🧱 Brick {brick_id} {'▲' if d == 1 else '▼'} close={brick_close:.2f}{RESET}")
