@@ -334,7 +334,8 @@ def run_ws():
                         apply_logic_on_brick(state, brick_close, d, brick_id)
                 else:
                     # debug opcional quando o tick não tem preço
-                    # print(f"{GRAY}[DEBUG] Tick ignorado (sem preço válido){RESET}")
+                    print(f"{GRAY}[DEBUG] Tick ignorado (sem preço válido){RESET}")
+                    last_tick_ts = time.time()
                     pass
             except Exception as e:
                 print(f"{YELLOW}⚠️ on_msg error:{RESET}", e)
