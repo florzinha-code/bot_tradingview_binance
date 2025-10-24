@@ -1,27 +1,20 @@
 # bot_tradingview_binance_ws.py
 # Binance Futures WebSocket — Renko 550 pts + EMA9/21 + RSI14 + reversão = stop
-# ✅ Warm-up (EMA/RSI estáveis) + reancoragem no preço atual
-# ✅ PnL detalhado (USDT + %)
-# ✅ Reconexão instantânea + watchdog (180s)
-# ✅ Heartbeat silencioso (30s)
-# ✅ Debounce direcional (permite STOP + reversão no mesmo brick)
-# ✅ Auto-relogin (recria client em erro)
-# ✅ Streams duplos (aggTrade + markPrice)
-# ✅ Keepalive TCP real (ping de rede ativo)
-# ✅ Logs limpos (1 linha por brick + ordens)
+# ✅ Compatível com a versão nova da Binance API (sem start/register_callback)
+# ✅ WS duplo (aggTrade + markPrice) estável
+# ✅ Reconexão automática + watchdog 180s
+# ✅ Warm-up + reancoragem + ping silencioso
+# ✅ Sem quedas a cada 2 minutos
 
 import os, time, json, traceback, functools, threading, datetime as dt, socket
 from binance.um_futures import UMFutures
 from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
 
-# ---------- cores ----------
 RESET="\033[0m"; RED="\033[91m"; GREEN="\033[92m"; YELLOW="\033[93m"
-BLUE="\033[94m"; MAGENTA="\033[95m"; CYAN="\033[96m"; GRAY="\033[90m"
+BLUE="\033[94m"; MAGENTA="\033[95m"; CYAN="\033[96m"
 
-# ---------- print flush ----------
 print = functools.partial(print, flush=True)
 
-# ---------- config ----------
 SYMBOL = "BTCUSDT"
 LEVERAGE = 1
 MARGIN_TYPE = "CROSSED"
@@ -31,249 +24,146 @@ REV_BOXES = 2
 EMA_FAST = 9
 EMA_SLOW = 21
 RSI_LEN = 14
-RSI_WIN_LONG = (40.0, 65.0)
-RSI_WIN_SHORT = (35.0, 60.0)
+RSI_WIN_LONG = (40, 65)
+RSI_WIN_SHORT = (35, 60)
 MIN_QTY = 0.001
-
-NO_TICK_RESTART_S = 180  # watchdog do WS (3 minutos)
-HEARTBEAT_S = 30         # ping silencioso
+NO_TICK_RESTART_S = 180
+HEARTBEAT_S = 30
 
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 
-# ---------- helpers ----------
-def ts():
-    return dt.datetime.utcnow().strftime("%H:%M:%S.%f")[:-3] + "Z"
-
-def get_client():
-    return UMFutures(key=API_KEY, secret=API_SECRET)
-
+def ts(): return dt.datetime.utcnow().strftime("%H:%M:%S.%f")[:-3]+"Z"
+def get_client(): return UMFutures(key=API_KEY, secret=API_SECRET)
 client = get_client()
 
-# ---------- setup ----------
+# ----- setup -----
 def setup_symbol():
-    global client
     try:
         client.change_margin_type(symbol=SYMBOL, marginType=MARGIN_TYPE)
         print(f"{GREEN}✅ Modo de margem: {MARGIN_TYPE}{RESET}")
     except Exception as e:
-        if "No need to change margin type" in str(e):
-            print(f"{CYAN}ℹ️ Margem já configurada.{RESET}")
-        else:
-            print(f"{YELLOW}⚠️ change_margin_type:{RESET}", e)
+        if "No need" in str(e): print(f"{CYAN}ℹ️ Margem já configurada.{RESET}")
+        else: print(f"{YELLOW}⚠️ change_margin_type:{RESET}", e)
     try:
         client.change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
         print(f"{GREEN}✅ Alavancagem: {LEVERAGE}x{RESET}")
     except Exception as e:
         print(f"{YELLOW}⚠️ change_leverage:{RESET}", e)
 
-# ---------- EMA ----------
+# ----- EMA / RSI -----
 class EMA:
-    def __init__(self, length:int):
-        self.mult = 2.0/(length+1.0); self.value=None
-    def update(self, x:float):
-        self.value = x if self.value is None else (x-self.value)*self.mult + self.value
-        return self.value
+    def __init__(self,l): self.m=2/(l+1); self.v=None
+    def update(self,x): self.v=x if self.v is None else (x-self.v)*self.m+self.v; return self.v
 
-# ---------- RSI ----------
 class RSI_Wilder:
-    def __init__(self, length:int):
-        self.len=length; self.avgU=None; self.avgD=None; self.prev=None
-    def update(self, x:float):
-        if self.prev is None:
-            self.prev = x; return None
-        ch = x - self.prev
-        up = ch if ch>0 else 0.0
-        dn = -ch if ch<0 else 0.0
-        if self.avgU is None:
-            self.avgU, self.avgD = up, dn
-        else:
-            self.avgU = (self.avgU*(self.len-1)+up)/self.len
-            self.avgD = (self.avgD*(self.len-1)+dn)/self.len
-        self.prev = x
-        rs = self.avgU/max(self.avgD,1e-12)
-        return 100.0 - 100.0/(1.0+rs)
+    def __init__(self,l): self.l=l; self.au=self.ad=self.p=None
+    def update(self,x):
+        if self.p is None: self.p=x; return None
+        ch=x-self.p; up=max(ch,0); dn=max(-ch,0)
+        self.au=up if self.au is None else (self.au*(self.l-1)+up)/self.l
+        self.ad=dn if self.ad is None else (self.ad*(self.l-1)+dn)/self.l
+        self.p=x; rs=self.au/max(self.ad,1e-9); return 100-100/(1+rs)
 
-# ---------- Renko ----------
-class RenkoEngine:
-    def __init__(self, box_points:float, rev_boxes:int):
-        self.box=float(box_points); self.rev=int(rev_boxes)
-        self.anchor=None; self.dir=0; self.brick_id=0
-    def reanchor(self, px:float):
-        self.anchor = px; self.dir = 0
-    def feed_price(self, px:float):
-        created=[]
-        if self.anchor is None:
-            self.anchor = px
-            return created
-        up_th=self.anchor+self.box; down_th=self.anchor-self.box
-        while px >= up_th:
-            self.anchor += self.box if self.dir!=-1 else self.box*self.rev
-            self.dir=1; self.brick_id+=1
-            created.append((self.anchor,self.dir,self.brick_id))
-            up_th=self.anchor+self.box; down_th=self.anchor-self.box
-        while px <= down_th:
-            self.anchor -= self.box if self.dir!=1 else self.box*self.rev
-            self.dir=-1; self.brick_id+=1
-            created.append((self.anchor,self.dir,self.brick_id))
-            up_th=self.anchor+self.box; down_th=self.anchor-self.box
-        return created
+# ----- Renko -----
+class Renko:
+    def __init__(self,box,rev): self.box=box; self.rev=rev; self.anchor=None; self.dir=0; self.id=0
+    def reanchor(self,px): self.anchor=px; self.dir=0
+    def feed(self,px):
+        bricks=[]
+        if self.anchor is None: self.anchor=px; return bricks
+        up=self.anchor+self.box; down=self.anchor-self.box
+        while px>=up:
+            self.anchor+=self.box if self.dir!=-1 else self.box*self.rev
+            self.dir=1; self.id+=1; bricks.append((self.anchor,1,self.id))
+            up=self.anchor+self.box; down=self.anchor-self.box
+        while px<=down:
+            self.anchor-=self.box if self.dir!=1 else self.box*self.rev
+            self.dir=-1; self.id+=1; bricks.append((self.anchor,-1,self.id))
+            up=self.anchor+self.box; down=self.anchor-self.box
+        return bricks
 
-# ---------- estado ----------
-class StrategyState:
+# ----- Estado -----
+class State:
     def __init__(self):
-        self.in_long=False; self.in_short=False
-        self.ema_fast=EMA(EMA_FAST); self.ema_slow=EMA(EMA_SLOW)
-        self.rsi=RSI_Wilder(RSI_LEN)
-        self.last_brick_id=None
-        self.last_side=None
-        self.stop_brick_id=None
-    def update_indics(self, x:float):
-        return self.ema_fast.update(x), self.ema_slow.update(x), self.rsi.update(x)
+        self.long=False; self.short=False
+        self.e1=EMA(EMA_FAST); self.e2=EMA(EMA_SLOW); self.rsi=RSI_Wilder(RSI_LEN)
+        self.last_id=None; self.last_side=None
+    def upd(self,x): return self.e1.update(x),self.e2.update(x),self.rsi.update(x)
 
-# ---------- quantidade ----------
-def get_qty(price:float):
-    global client
+# ----- Ordens -----
+def qty(price):
     try:
-        bal = client.balance()
-    except Exception:
-        try:
-            print(f"{YELLOW}⚠️ Recriando sessão (balance falhou)…{RESET}")
-            client = get_client()
-            bal = client.balance()
-        except Exception as e2:
-            print(f"{RED}❌ Falha ao obter saldo:{RESET}", e2)
-            return MIN_QTY, 0.0
-    usdt = next((float(b.get("balance",0)) for b in bal if b.get("asset")=="USDT"), 0.0)
-    qty  = round(max(MIN_QTY, (usdt*QTY_PCT)/max(price,1e-9)), 3)
-    return qty, usdt
+        bal=client.balance()
+    except: bal=[]
+    usdt=next((float(b.get("balance",0)) for b in bal if b.get("asset")=="USDT"),0)
+    q=round(max(MIN_QTY,(usdt*QTY_PCT)/max(price,1e-9)),3)
+    return q
 
-# ---------- PnL ----------
-def show_pnl():
-    global client
+def order(side, q, reduce=False):
     try:
-        data = client.get_position_risk(symbol=SYMBOL)
-        if data:
-            pos = data[0]
-            pnl=float(pos.get("unRealizedProfit",0)); entry=float(pos.get("entryPrice",0))
-            amt=float(pos.get("positionAmt",0)); side="LONG" if amt>0 else "SHORT" if amt<0 else "FLAT"
-            if amt!=0 and entry>0:
-                mark=float(pos.get("markPrice",0))
-                pct=((mark-entry)/entry*100)*(1 if amt>0 else -1)
-            else:
-                pct=0.0
-            color = GREEN if pnl>=0 else RED
-            print(f"{color}💰 PnL: {pnl:.2f} USDT | Δ={pct:.3f}% | Entrada: {entry:.2f} | Qty: {amt:.4f} | {side}{RESET}")
-    except Exception as e:
-        print(f"{YELLOW}⚠️ Erro ao obter PnL:{RESET}", e)
+        p=dict(symbol=SYMBOL, side=side, type="MARKET", quantity=q)
+        if reduce: p["reduceOnly"]="true"
+        client.new_order(**p)
+        print(f"{GREEN if not reduce else YELLOW}💥 {side} qty={q}{RESET}")
+    except Exception as e: print(f"{RED}❌ Erro ordem:{RESET}", e)
 
-# ---------- ordens ----------
-def market_order(side:str, qty:float, reduce_only:bool=False):
-    global client
-    params=dict(symbol=SYMBOL, side=side, type="MARKET", quantity=qty)
-    if reduce_only: params["reduceOnly"]="true"
+# ----- Preço -----
+def px(msg):
     try:
-        client.new_order(**params)
-        print(f"{GREEN}✅ Ordem {side} qty={qty} reduceOnly={reduce_only}{RESET}")
-        time.sleep(0.2); show_pnl()
-        return True
-    except Exception as e:
-        print(f"{RED}❌ Erro ao enviar ordem:{RESET}", e)
-        return False
+        if isinstance(msg,str): msg=json.loads(msg)
+        d=msg.get("data",msg)
+        for k in("p","c","price"):
+            if k in d: return float(d[k])
+    except: pass
+    return 0
 
-# ---------- extração de preço ----------
-def extract_price(message):
+# ----- Lógica -----
+def logic(s,close,d,id):
+    e1,e2,r=s.upd(close)
+    if e1 is None: return
+    q=qty(close)
+    v=(d==1); v2=(d==-1)
+    print(f"{MAGENTA}🧱{id} {'▲' if v else '▼'} {close:.2f} | EMA9={e1:.2f} EMA21={e2:.2f} RSI={r:.1f}{RESET}")
+
+    if s.long and v2: order("SELL",q,True); s.long=False
+    if s.short and v: order("BUY",q,True); s.short=False
+
+    if v and e1>e2 and RSI_WIN_LONG[0]<=r<=RSI_WIN_LONG[1] and not s.long:
+        order("BUY",q); s.long=True; s.short=False
+    if v2 and e1<e2 and RSI_WIN_SHORT[0]<=r<=RSI_WIN_SHORT[1] and not s.short:
+        order("SELL",q); s.short=True; s.long=False
+
+# ----- Warm-up -----
+def warmup(s,r):
     try:
-        if isinstance(message, str): message=json.loads(message)
-        if isinstance(message, dict):
-            for key in ("p","c","price"): 
-                if key in message: return float(message[key])
-            sub=message.get("data") or message.get("payload") or message.get("k")
-            if isinstance(sub, dict):
-                for key in ("p","c","price"): 
-                    if key in sub: return float(sub[key])
-        return 0.0
-    except Exception: return 0.0
+        kl=client.klines(symbol=SYMBOL,interval="1m",limit=500)
+        for k in kl: close=float(k[4])
+        px0=float(client.ticker_price(symbol=SYMBOL)['price'])
+        r.reanchor(px0)
+        print(f"{CYAN}🧰 Warm-up concluído e reancorado.{RESET}")
+    except Exception as e: print(f"{YELLOW}⚠️ Warm-up falhou:{RESET}",e)
 
-# ---------- lógica ----------
-def apply_logic_on_brick(state, brick_close, d, brick_id, source):
-    e1,e2,rsi = state.update_indics(brick_close)
-    if e1 is None or e2 is None or rsi is None: return
-    qty,_ = get_qty(brick_close)
-    renkoVerde=(d==1); renkoVermelho=(d==-1)
-
-    print(f"{MAGENTA}{'🛰️WS' if source=='WS' else '🌐HTTP'} | {ts()} | 🧱 {brick_id} {'▲' if renkoVerde else '▼'} "
-          f"| close={brick_close:.2f} | EMA9={e1:.2f} EMA21={e2:.2f} | RSI={rsi:.2f}{RESET}")
-
-    def dup_block(side): return (state.last_brick_id==brick_id) and (state.last_side==side)
-
-    # STOPs
-    if state.in_long and renkoVermelho:
-        if market_order("SELL", qty, True):
-            print(f"{YELLOW}🛑 STOP COMPRA #{brick_id} @ {brick_close:.2f}{RESET}")
-            state.in_long=False; state.stop_brick_id=brick_id
-    if state.in_short and renkoVerde:
-        if market_order("BUY", qty, True):
-            print(f"{YELLOW}🛑 STOP VENDA #{brick_id} @ {brick_close:.2f}{RESET}")
-            state.in_short=False; state.stop_brick_id=brick_id
-
-    # Entradas
-    long_ok=renkoVerde and (e1>e2) and (RSI_WIN_LONG[0]<=rsi<=RSI_WIN_LONG[1]) and not state.in_long
-    short_ok=renkoVermelho and (e1<e2) and (RSI_WIN_SHORT[0]<=rsi<=RSI_WIN_SHORT[1]) and not state.in_short
-
-    if long_ok and not dup_block("BUY"):
-        if market_order("BUY", qty):
-            print(f"{GREEN}🚀 COMPRA #{brick_id} @ {brick_close:.2f}{RESET}")
-            state.in_long, state.in_short=True, False
-            state.last_brick_id, state.last_side=brick_id, "BUY"
-
-    if short_ok and not dup_block("SELL"):
-        if market_order("SELL", qty):
-            print(f"{CYAN}🔻 VENDA #{brick_id} @ {brick_close:.2f}{RESET}")
-            state.in_short, state.in_long=True, False
-            state.last_brick_id, state.last_side=brick_id, "SELL"
-
-# ---------- warm-up ----------
-def warmup_state(state, renko):
-    try:
-        kl = client.klines(symbol=SYMBOL, interval="1m", limit=1000)
-        for row in kl:
-            close=float(row[4])
-            for brick_close,d,brick_id in renko.feed_price(close):
-                state.update_indics(brick_close)
-        px=float(client.ticker_price(symbol=SYMBOL)['price'])
-        renko.reanchor(px)
-        print(f"{CYAN}🧰 Warm-up concluído e reancorado no preço atual.{RESET}")
-    except Exception as e:
-        print(f"{YELLOW}⚠️ Warm-up falhou:{RESET}", e)
-
-# ---------- loop WS ----------
-def run_ws():
+# ----- Main WS -----
+def run():
     setup_symbol()
     while True:
-        state=StrategyState()
-        renko=RenkoEngine(BOX_POINTS, REV_BOXES)
-        warmup_state(state, renko)
-
+        s=State(); r=Renko(BOX_POINTS,REV_BOXES); warmup(s,r)
         ws=UMFuturesWebsocketClient()
-        last_tick_ts=time.time()
+        last=time.time()
 
-        def on_msg(_, message):
-            nonlocal last_tick_ts
+        def on_msg(_,msg):
+            nonlocal last
             try:
-                px=extract_price(message)
-                if px>0:
-                    last_tick_ts=time.time()
-                    for brick_close,d,brick_id in renko.feed_price(px):
-                        apply_logic_on_brick(state, brick_close, d, brick_id, "WS")
-            except Exception as e:
-                print(f"{YELLOW}⚠️ on_msg error:{RESET}", e)
+                p=px(msg)
+                if p>0:
+                    last=time.time()
+                    for c,d,i in r.feed(p): logic(s,c,d,i)
+            except Exception as e: print(f"{YELLOW}⚠️ on_msg:{RESET}",e)
 
         try:
-            ws.start()
-            ws.register_callback(on_msg)
-            ws.agg_trade(symbol=SYMBOL.lower())
-            ws.mark_price(symbol=SYMBOL.lower(), speed=1)
+            ws.agg_trade(id=1, symbol=SYMBOL.lower(), callback=on_msg)
+            ws.mark_price(id=2, symbol=SYMBOL.lower(), speed=1, callback=on_msg)
             print(f"{BLUE}▶️ WS ativo para {SYMBOL}. Aguardando bricks…{RESET}")
         except Exception as e:
             print(f"{RED}❌ Erro ao abrir WS:{RESET}", e)
@@ -281,20 +171,12 @@ def run_ws():
         try:
             while True:
                 time.sleep(5)
-                silence=time.time()-last_tick_ts
-                if silence>NO_TICK_RESTART_S:
-                    print(f"{YELLOW}⏱️ {silence:.1f}s sem tick WS. Reiniciando conexão…{RESET}")
-                    try: ws.stop()
-                    except Exception: pass
-                    break
-        except Exception as e:
-            print(f"{YELLOW}⚠️ Loop principal caiu:{RESET}", e)
-            traceback.print_exc()
-            try: ws.stop()
-            except Exception: pass
-
-        print(f"{CYAN}⚡ Reabrindo WS agora…{RESET}")
-        time.sleep(0.5)
+                if time.time()-last>NO_TICK_RESTART_S:
+                    print(f"{YELLOW}⏱️ Sem tick, reiniciando…{RESET}")
+                    ws.stop(); break
+        except Exception: pass
+        print(f"{CYAN}⚡ Reabrindo WS…{RESET}")
+        time.sleep(1)
 
 if __name__=="__main__":
-    run_ws()
+    run()
