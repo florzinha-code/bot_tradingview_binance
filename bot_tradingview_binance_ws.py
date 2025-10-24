@@ -200,8 +200,8 @@ def run_ws():
                 for b,d,bid in renko.feed_price(px):apply_logic(state,b,d,bid,"WS")
 
         try:
-            ws.agg_trade(symbol=SYMBOL.lower(),on_msg)
-            ws.mark_price(symbol=SYMBOL.lower(),"1s",on_msg)
+            ws.agg_trade(SYMBOL.lower(),on_msg)
+            ws.mark_price(SYMBOL.lower(),"1s",on_msg)
             print(f"{BLUE}▶️ WS ativo para {SYMBOL}. Aguardando bricks…{RESET}")
         except Exception as e:
             print(f"{RED}❌ Erro abrir WS:{RESET}",e)
