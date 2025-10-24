@@ -1,4 +1,4 @@
-# bot_tradingview_binance_ws.py — COMBAT READY+
+# bot_tradingview_binance_ws.py — COMBAT READY++
 # Binance Futures — Renko 550 pts + EMA9/21 + RSI14
 # - Warm-up (EMA/RSI estáveis) + reancoragem no preço atual
 # - PnL detalhado só nas ordens
@@ -7,12 +7,13 @@
 # - Keepalive real: ping WS + TCP keepalive
 # - Fallback HTTP se WS ficar mudo > 2s
 # - Logs limpos + anti-spam + extractor resiliente
+# - Callback compatível (1 ou 2 args) + sniffer RAW (até 3 amostras)
 
-import os, time, json, threading, datetime as dt, socket, functools, logging, warnings
+import os, time, json, threading, datetime as dt, socket, functools, logging, warnings, traceback
 from binance.um_futures import UMFutures
 from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
 
-# silencia avisos do SDK
+# ── silencia avisos do SDK
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 for name in ("binance", "binance.websocket", "binance.websocket.websocket_client"):
     logging.getLogger(name).setLevel(logging.ERROR)
@@ -43,6 +44,9 @@ QUIET_RESTART = True
 RESTART_SLEEP_S = 0.2
 DEBUG_HEARTBEAT = False
 HEARTBEAT_EVERY_S = 10
+
+# sniffer: quantas mensagens RAW mostrar quando não extrair preço
+RAW_SNIFF_MAX = 3
 
 API_KEY    = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
@@ -115,24 +119,39 @@ class State:
 
 # ---------- preço ----------
 def extract_px(msg):
+    """Extrai preço de vários formatos possíveis (aggTrade, markPrice, payload/data/k)."""
     try:
-        if isinstance(msg,str): msg=json.loads(msg)
-        if isinstance(msg,list) and msg: msg=msg[0]
+        if isinstance(msg,str): 
+            try: msg=json.loads(msg)
+            except: return 0.0
+        if isinstance(msg, (list, tuple)) and msg:
+            msg = msg[-1]  # pega o último item se vier em lista
+
         def pick(d):
             if not isinstance(d,dict): return 0.0
-            for k in ("p","c","price","ap","mp"):
-                v=d.get(k)
+            # formatos comuns
+            for k in ("p","c","price","ap","mp","P","C"):
+                v = d.get(k)
                 if v is not None:
                     try: return float(v)
                     except: pass
+            # mark price update costuma vir com "p" ou "markPrice"
+            for k in ("markPrice","indexPrice","lastPrice"):
+                v = d.get(k)
+                if v is not None:
+                    try: return float(v)
+                    except: pass
+            # nested
             for k in ("data","payload","k"):
-                sub=d.get(k)
+                sub = d.get(k)
                 if isinstance(sub,dict):
-                    val=pick(sub)
+                    val = pick(sub)
                     if val: return val
             return 0.0
+
         return pick(msg) or 0.0
-    except: return 0.0
+    except:
+        return 0.0
 
 def calc_qty(p):
     try:
@@ -140,7 +159,8 @@ def calc_qty(p):
         usdt=float(next((b.get("balance") for b in bal if b.get("asset")=="USDT"),0.0))
         q=(usdt*QTY_PCT)/max(p,1e-9)
         return max(MIN_QTY,round(q,3))
-    except: return MIN_QTY
+    except: 
+        return MIN_QTY
 
 # ---------- PnL ----------
 def show_pnl():
@@ -170,7 +190,7 @@ def market_order(side,q,reduce=False):
         tag=(YELLOW if reduce else GREEN)
         print(f"{tag}✅ {side} qty={q} reduceOnly={reduce}{RESET}")
         time.sleep(0.2); show_pnl(); return True
-    except Exception as e:
+    except Exception:
         try:
             print(f"{YELLOW}⚠️ Recriando sessão e reenviando…{RESET}")
             client=get_client()
@@ -181,7 +201,8 @@ def market_order(side,q,reduce=False):
             msg=str(e2)
             if "-2019" in msg or "Margin is insufficient" in msg:
                 print(f"{RED}❌ Ordem recusada: margem insuficiente (-2019).{RESET}")
-            else: print(f"{RED}❌ Erro ordem:{RESET}",e2)
+            else: 
+                print(f"{RED}❌ Erro ordem:{RESET}",e2)
             return False
 
 # ---------- lógica ----------
@@ -191,6 +212,8 @@ def on_brick(state,close,d,brick_id):
     verde=(d==1); verm=(d==-1)
     print(f"{MAGENTA}{ts()} | 🧱 {brick_id} {'▲' if verde else '▼'} | close={close:.2f} | EMA9={e1:.2f} EMA21={e2:.2f} | RSI={r:.2f}{RESET}")
     q=calc_qty(close)
+
+    # STOP (permite reversão no mesmo tijolo)
     if state.in_long and verm:
         if market_order("SELL",q,True):
             print(f"{YELLOW}🛑 STOP COMPRA #{brick_id}{RESET}")
@@ -199,6 +222,8 @@ def on_brick(state,close,d,brick_id):
         if market_order("BUY",q,True):
             print(f"{YELLOW}🛑 STOP VENDA #{brick_id}{RESET}")
             state.in_short=False
+
+    # ENTRADAS (debounce: evita MESMA direção no MESMO tijolo)
     def dup(s): return state.last_entry_brick==brick_id and state.last_entry_side==s
     if verde and e1>e2 and RSI_WIN_LONG[0]<=r<=RSI_WIN_LONG[1] and not state.in_long and not dup("BUY"):
         if market_order("BUY",q):
@@ -219,23 +244,39 @@ def warmup(state,renko):
         px=float(client.ticker_price(symbol=SYMBOL)['price'])
         renko.reanchor(px)
         print(f"{CYAN}🧰 Warm-up concluído e reancorado.{RESET}")
-    except Exception as e: print(f"{YELLOW}⚠️ Warm-up:{RESET}",e)
+    except Exception as e: 
+        print(f"{YELLOW}⚠️ Warm-up:{RESET}",e)
 
 # ---------- loop principal ----------
 def run():
     setup_symbol()
     while True:
         state=State(); renko=Renko(BOX_POINTS,REV_BOXES); warmup(state,renko)
-        ws=UMFuturesWebsocketClient(); last_tick=time.time(); stop_ev=threading.Event()
+        ws=UMFuturesWebsocketClient()
+        last_tick=time.time()
+        stop_ev=threading.Event()
+        raw_sniffed=[0]  # contador mutável simples
 
-        def on_msg(_,msg):
+        # callback compatível: algumas versões chamam (message), outras (id, message)
+        def on_msg(*args):
             nonlocal last_tick
             try:
-                p=extract_px(msg)
+                msg = args[-1]  # pega SEMPRE o último argumento como mensagem
+                p   = extract_px(msg)
                 if p>0:
                     last_tick=time.time()
                     for c,d,i in renko.feed(p): on_brick(state,c,d,i)
-            except Exception as e: print(f"{YELLOW}⚠️ on_msg:{RESET}",e)
+                else:
+                    # sniffer: mostra até RAW_SNIFF_MAX amostras pra gente ver formato real
+                    if raw_sniffed[0] < RAW_SNIFF_MAX:
+                        raw_sniffed[0]+=1
+                        try:
+                            preview = msg if isinstance(msg,str) else json.dumps(msg)[:300]
+                        except Exception:
+                            preview = str(msg)[:300]
+                        print(f"{YELLOW}🧩 RAW WS message (sem preço) [{raw_sniffed[0]}]:{RESET} {preview}")
+            except Exception as e: 
+                print(f"{YELLOW}⚠️ on_msg:{RESET}", e)
 
         def keepalive():
             while not stop_ev.is_set():
@@ -271,14 +312,22 @@ def run():
                 time.sleep(1)
 
         try:
-            ws.agg_trade(id=1,symbol=SYMBOL.lower(),callback=on_msg)
-            try: ws.mark_price(id=2,symbol=SYMBOL.lower(),speed=1,callback=on_msg)
-            except TypeError: ws.mark_price(id=2,symbol=SYMBOL.lower(),callback=on_msg)
+            # algumas versões exigem ws.start() antes das inscrições
+            try: ws.start()
+            except Exception: pass
+
+            ws.agg_trade(id=1, symbol=SYMBOL.lower(), callback=on_msg)
+            try:
+                ws.mark_price(id=2, symbol=SYMBOL.lower(), speed=1, callback=on_msg)
+            except TypeError:
+                ws.mark_price(id=2, symbol=SYMBOL.lower(), callback=on_msg)
+
             threading.Thread(target=keepalive,daemon=True).start()
             threading.Thread(target=http_fallback,daemon=True).start()
             threading.Thread(target=heartbeat,daemon=True).start()
             print(f"{BLUE}▶️ WS ativo para {SYMBOL}. Aguardando bricks…{RESET}")
-        except Exception as e: print(f"{RED}❌ Erro ao abrir WS:{RESET}",e)
+        except Exception as e: 
+            print(f"{RED}❌ Erro ao abrir WS:{RESET}", e)
 
         try:
             while True:
@@ -286,8 +335,14 @@ def run():
                 if time.time()-last_tick>NO_TICK_RESTART_S:
                     if not QUIET_RESTART:
                         print(f"{YELLOW}⏱️ Sem tick, reiniciando…{RESET}")
-                    stop_ev.set(); ws.stop(); break
-        except: stop_ev.set(); ws.stop()
+                    stop_ev.set()
+                    try: ws.stop()
+                    except Exception: pass
+                    break
+        except Exception:
+            stop_ev.set()
+            try: ws.stop()
+            except Exception: pass
 
         if not QUIET_RESTART:
             print(f"{CYAN}⚡ Reabrindo WS…{RESET}")
