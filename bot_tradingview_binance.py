@@ -58,20 +58,19 @@ def webhook():
             qty = 0.001
         print(f"📦 Quantidade final enviada: {qty} BTC")
 
-        # 🚀 Executa ordem
-        if action == 'buy':
-            order = client.new_order(symbol=symbol, side="BUY", type="MARKET", quantity=qty)
-            print("✅ Ordem de COMPRA:", order)
-            return jsonify({"status": "✅ Buy executado", "qty": qty})
-
-        elif action == 'sell':
-            order = client.new_order(symbol=symbol, side="SELL", type="MARKET", quantity=qty)
-            print("✅ Ordem de VENDA:", order)
-            return jsonify({"status": "✅ Sell executado", "qty": qty})
-
+        # 🚀 Define lado da ordem com suporte aos 4 tipos de ação
+        if action in ('buy', 'stop_sell'):
+            side = "BUY"
+        elif action in ('sell', 'stop_buy'):
+            side = "SELL"
         else:
             print("❌ Ação inválida:", action)
             return jsonify({"status": "❌ Ação inválida"}), 400
+
+        # 🚀 Executa ordem
+        order = client.new_order(symbol=symbol, side=side, type="MARKET", quantity=qty)
+        print(f"✅ Ordem executada: {side}", order)
+        return jsonify({"status": f"✅ {side} executado", "qty": qty})
 
     except Exception as e:
         print("❌ Erro geral:", e)
