@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from binance.um_futures import UMFutures
-import json, os
+import json, os, math
 
 app = Flask(__name__)
 
@@ -9,7 +9,6 @@ API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 
 client = UMFutures(key=API_KEY, secret=API_SECRET)
-
 
 @app.route('/', methods=['POST'])
 def webhook():
@@ -31,7 +30,7 @@ def webhook():
 
         symbol = "BTCUSDT"
         leverage = 1
-        margin_type = "CROSSED"  # modo Cross
+        margin_type = "CROSSED"  # <-- modo Cross
 
         # 🔧 Define modo de margem e alavancagem
         try:
@@ -50,6 +49,15 @@ def webhook():
         price = float(client.ticker_price(symbol=symbol)['price'])
         print(f"💹 Preço atual BTCUSDT: {price}")
 
+        # 📦 Calcula quantidade — 85% do saldo / preço (sempre arredonda para baixo)
+        qty = math.floor((usdt_balance * 0.85 / price) * 1000) / 1000
+
+        # Garante mínimo aceito pela Binance
+        if qty < 0.001:
+            qty = 0.001
+
+        print(f"📦 Quantidade final enviada: {qty} BTC")
+
         # 🚀 Define lado da ordem com suporte aos 4 tipos de ação
         if action in ('buy', 'stop_sell'):
             side = "BUY"
@@ -59,30 +67,9 @@ def webhook():
             print("❌ Ação inválida:", action)
             return jsonify({"status": "❌ Ação inválida"}), 400
 
-        # 📦 Tenta executar ordem com ajuste dinâmico de margem
-        attempts = [0.85, 0.80, 0.75]
-        order = None
-
-        for p in attempts:
-            qty = round((usdt_balance * p) / price, 4)
-            if qty < 0.001:
-                qty = 0.001
-            try:
-                order = client.new_order(symbol=symbol, side=side, type="MARKET", quantity=qty)
-                print(f"✅ Ordem executada: {side} com {p*100:.0f}% do saldo ({qty} BTC)")
-                break
-            except Exception as e:
-                if "Margin is insufficient" in str(e):
-                    print(f"⚠️ Margem insuficiente com {p*100:.0f}%, tentando {int(p*100-5)}%...")
-                    continue
-                else:
-                    print(f"❌ Erro inesperado: {e}")
-                    raise e
-
-        if not order:
-            print("❌ Falha após 3 tentativas — saldo insuficiente.")
-            return jsonify({"status": "❌ Margem insuficiente mesmo após ajustes"}), 400
-
+        # 🚀 Executa ordem
+        order = client.new_order(symbol=symbol, side=side, type="MARKET", quantity=qty)
+        print(f"✅ Ordem executada: {side}", order)
         return jsonify({"status": f"✅ {side} executado", "qty": qty})
 
     except Exception as e:
