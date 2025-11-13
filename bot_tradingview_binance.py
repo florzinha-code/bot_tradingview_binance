@@ -4,7 +4,6 @@ import json, os, math
 
 app = Flask(__name__)
 
-# 🔑 Chaves da Binance (Render Environment)
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 
@@ -17,7 +16,7 @@ def webhook():
         action = data.get('action')
         print(f"🚨 ALERTA RECEBIDO: {action}")
 
-        # 💰 Consulta saldo
+        # 💰 Saldo
         balance = client.balance()
         usdt_balance = next(
             (float(b['balance']) for b in balance if b['asset'] == 'USDT'),
@@ -30,7 +29,7 @@ def webhook():
 
         symbol = "BTCUSDT"
         leverage = 1
-        margin_type = "CROSSED"  # <-- modo Cross
+        margin_type = "CROSSED"
 
         # 🔧 Define modo de margem e alavancagem
         try:
@@ -49,28 +48,43 @@ def webhook():
         price = float(client.ticker_price(symbol=symbol)['price'])
         print(f"💹 Preço atual BTCUSDT: {price}")
 
-        # 📦 Calcula quantidade — 85% do saldo / preço (sempre arredonda para baixo)
+        # 📦 Quantidade
         qty = math.floor((usdt_balance * 0.85 / price) * 1000) / 1000
-
-        # Garante mínimo aceito pela Binance
         if qty < 0.001:
             qty = 0.001
 
         print(f"📦 Quantidade final enviada: {qty} BTC")
 
-        # 🚀 Define lado da ordem com suporte aos 4 tipos de ação
-        if action in ('buy', 'stop_sell'):
+        # === LÓGICA DE ORDENS COM REDUCE-ONLY ===
+        reduce_only = False
+        side = None
+
+        if action == "buy":
             side = "BUY"
-        elif action in ('sell', 'stop_buy'):
+            reduce_only = False  # entrada
+        elif action == "sell":
             side = "SELL"
+            reduce_only = False  # entrada
+        elif action == "stop_buy":
+            side = "BUY"
+            reduce_only = True   # fechamento
+        elif action == "stop_sell":
+            side = "SELL"
+            reduce_only = True   # fechamento
         else:
-            print("❌ Ação inválida:", action)
             return jsonify({"status": "❌ Ação inválida"}), 400
 
         # 🚀 Executa ordem
-        order = client.new_order(symbol=symbol, side=side, type="MARKET", quantity=qty)
-        print(f"✅ Ordem executada: {side}", order)
-        return jsonify({"status": f"✅ {side} executado", "qty": qty})
+        order = client.new_order(
+            symbol=symbol,
+            side=side,
+            type="MARKET",
+            quantity=qty,
+            reduceOnly=reduce_only   # <<< AQUI ESTÁ A MÁGICA!
+        )
+
+        print(f"✅ Ordem executada: {side} (reduceOnly={reduce_only}) → {order}")
+        return jsonify({"status": "ok"})
 
     except Exception as e:
         print("❌ Erro geral:", e)
