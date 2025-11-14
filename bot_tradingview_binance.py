@@ -1,9 +1,10 @@
 from flask import Flask, request, jsonify
 from binance.um_futures import UMFutures
-import json, os, math
+import json, os
 
 app = Flask(__name__)
 
+# 🔑 Chaves da Binance (Render Environment)
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 
@@ -16,7 +17,7 @@ def webhook():
         action = data.get('action')
         print(f"🚨 ALERTA RECEBIDO: {action}")
 
-        # 💰 Saldo
+        # 💰 Consulta saldo
         balance = client.balance()
         usdt_balance = next(
             (float(b['balance']) for b in balance if b['asset'] == 'USDT'),
@@ -28,7 +29,7 @@ def webhook():
             return jsonify({"status": "❌ Saldo insuficiente"}), 400
 
         symbol = "BTCUSDT"
-        leverage = 1
+        leverage = 2          # <<<<<<<<<< ALAVANCAGEM DEFINIDA AQUI
         margin_type = "CROSSED"
 
         # 🔧 Define modo de margem e alavancagem
@@ -48,11 +49,8 @@ def webhook():
         price = float(client.ticker_price(symbol=symbol)['price'])
         print(f"💹 Preço atual BTCUSDT: {price}")
 
-        # 📦 Quantidade
-        qty = math.floor((usdt_balance * 0.85 / price) * 1000) / 1000
-        if qty < 0.001:
-            qty = 0.001
-
+        # 📦 Quantidade FIXA = 0,002 BTC
+        qty = 0.002
         print(f"📦 Quantidade final enviada: {qty} BTC")
 
         # === LÓGICA DE ORDENS COM REDUCE-ONLY ===
@@ -61,16 +59,16 @@ def webhook():
 
         if action == "buy":
             side = "BUY"
-            reduce_only = False  # entrada
+            reduce_only = False
         elif action == "sell":
             side = "SELL"
-            reduce_only = False  # entrada
+            reduce_only = False
         elif action == "stop_buy":
             side = "BUY"
-            reduce_only = True   # fechamento
+            reduce_only = True
         elif action == "stop_sell":
             side = "SELL"
-            reduce_only = True   # fechamento
+            reduce_only = True
         else:
             return jsonify({"status": "❌ Ação inválida"}), 400
 
@@ -80,7 +78,7 @@ def webhook():
             side=side,
             type="MARKET",
             quantity=qty,
-            reduceOnly=reduce_only   # <<< AQUI ESTÁ A MÁGICA!
+            reduceOnly=reduce_only
         )
 
         print(f"✅ Ordem executada: {side} (reduceOnly={reduce_only}) → {order}")
