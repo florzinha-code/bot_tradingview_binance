@@ -49,7 +49,7 @@ def webhook():
        print(f"💹 Preço atual BTCUSDT: {price}")
 
        # 📦 Quantidade
-       qty = 2
+       qty = 0,002
 
        print(f"📦 Quantidade final enviada: {qty} BTC")
 
