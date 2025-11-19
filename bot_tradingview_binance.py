@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from binance.um_futures import UMFutures
-import json, os, math
+import json, os
 
 app = Flask(__name__)
 
@@ -16,89 +16,46 @@ def webhook():
         action = data.get('action')
         print(f"🚨 ALERTA RECEBIDO: {action}")
 
-        # 💰 Saldo
-        balance = client.balance()
-        usdt_balance = next(
-            (float(b['balance']) for b in balance if b['asset'] == 'USDT'),
-            0.0
-        )
-        print(f"💰 Saldo FUTUROS USDT-M detectado: {usdt_balance:.3f} USDT")
-
-        if usdt_balance <= 5:
-            return jsonify({"status": "❌ Saldo insuficiente"}), 400
-
         symbol = "BTCUSDT"
         leverage = 2
-        margin_type = "CROSSED"
+        qty = 0.002
 
-        # 🔧 Define modo de margem e alavancagem
+        # ==========================
+        # CONFIG BÁSICA
+        # ==========================
         try:
-            client.change_margin_type(symbol=symbol, marginType=margin_type)
-            print("✅ Modo de margem definido como CROSS")
-        except Exception as e:
-            if "No need to change margin type" in str(e):
-                print("ℹ️ Margem já está CROSS.")
-            else:
-                print("⚠️ Erro ao mudar margem:", e)
+            client.change_margin_type(symbol=symbol, marginType="CROSSED")
+        except Exception:
+            pass
 
         client.change_leverage(symbol=symbol, leverage=leverage)
-        print(f"⚙️ Alavancagem definida: {leverage}x")
 
-        # 📈 Preço atual
-        price = float(client.ticker_price(symbol=symbol)['price'])
-        print(f"💹 Preço atual BTCUSDT: {price}")
+        # ==========================
+        # 🛑 STOP: FECHAR QUALQUER POSIÇÃO
+        # ==========================
+        if action in ("stop_buy", "stop_sell", "stop"):
+            print("🔻 Fechando posição com closePosition=True")
 
-        # 📦 Quantidade fixa para ENTRADA
-        qty = 0.002
-        print(f"📦 Quantidade de ENTRADA: {qty} BTC")
-
-        # =======================
-        # 🚨 LÓGICA DOS STOPS
-        # =======================
-        if action in ("stop_buy", "stop_sell"):
-            print("🛑 STOP recebido, tentando fechar posição aberta...")
-
-            # Pegamos a posição atual na Binance
-            positions = client.get_position_risk(symbol=symbol)
-            print(f"📊 Posições retornadas: {positions}")
-
-            pos = None
-            for p in positions:
-                amt = float(p.get("positionAmt", "0"))
-                if amt != 0.0:
-                    pos = p
-                    break
-
-            if not pos:
-                print("ℹ️ Nenhuma posição aberta para fechar.")
-                return jsonify({"status": "ok", "info": "sem_posicao"}), 200
-
-            position_amt = float(pos["positionAmt"])
-            side_close = "SELL" if position_amt > 0 else "BUY"
-            qty_close = abs(position_amt)
-
-            print(f"🔒 Fechando {qty_close} BTC na direção {side_close} (reduceOnly=True)")
-
+            # FECHA VIA MARKET
             order = client.new_order(
                 symbol=symbol,
-                side=side_close,
+                side="BUY",   # Binance ignora quando closePosition=True
                 type="MARKET",
-                quantity=qty_close,
-                reduceOnly=True
+                closePosition=True
             )
 
-            print(f"✅ Ordem de STOP executada → {order}")
-            return jsonify({"status": "ok", "closed_qty": qty_close})
+            print(f"✅ STOP EXECUTADO → {order}")
+            return jsonify({"status": "ok", "stop": True})
 
-        # =======================
+        # ==========================
         # 🚀 ENTRADAS NORMAIS
-        # =======================
+        # ==========================
         if action == "buy":
             side = "BUY"
         elif action == "sell":
             side = "SELL"
         else:
-            return jsonify({"status": "❌ Ação inválida"}), 400
+            return jsonify({"status": "❌ ação inválida"}), 400
 
         order = client.new_order(
             symbol=symbol,
@@ -107,11 +64,11 @@ def webhook():
             quantity=qty
         )
 
-        print(f"✅ Ordem de ENTRADA executada: {side} → {order}")
-        return jsonify({"status": "ok"})
+        print(f"✅ ENTRADA EXECUTADA: {side} → {order}")
+        return jsonify({"status": "ok", "side": side})
 
     except Exception as e:
-        print("❌ Erro geral:", e)
+        print("❌ ERRO GERAL:", e)
         return jsonify({"error": str(e)}), 500
 
 
