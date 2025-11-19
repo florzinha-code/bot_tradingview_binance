@@ -48,38 +48,47 @@ def webhook():
         price = float(client.ticker_price(symbol=symbol)['price'])
         print(f"💹 Preço atual BTCUSDT: {price}")
 
-        # 📦 Quantidade
+        # 📦 Quantidade fixa para ENTRADA
         qty = 0.002
-
-        print(f"📦 Quantidade final enviada: {qty} BTC")
+        print(f"📦 Quantidade de ENTRADA: {qty} BTC")
 
         # =======================
-        # 🚨 LÓGICA NOVA DOS STOPS
+        # 🚨 LÓGICA DOS STOPS
         # =======================
+        if action in ("stop_buy", "stop_sell"):
+            print("🛑 STOP recebido, tentando fechar posição aberta...")
 
-        # STOP DE COMPRA → fecha posição BUY
-        if action == "stop_buy":
-            print("🔻 Fechando posição de COMPRA com closePosition=True")
+            # Pegamos a posição atual na Binance
+            positions = client.position_risk(symbol=symbol)
+            print(f"📊 Posições retornadas: {positions}")
+
+            pos = None
+            for p in positions:
+                amt = float(p.get("positionAmt", "0"))
+                if amt != 0.0:
+                    pos = p
+                    break
+
+            if not pos:
+                print("ℹ️ Nenhuma posição aberta para fechar.")
+                return jsonify({"status": "ok", "info": "sem_posicao"}), 200
+
+            position_amt = float(pos["positionAmt"])
+            side_close = "SELL" if position_amt > 0 else "BUY"
+            qty_close = abs(position_amt)
+
+            print(f"🔒 Fechando {qty_close} BTC na direção {side_close} (reduceOnly=True)")
+
             order = client.new_order(
                 symbol=symbol,
-                side="SELL",
+                side=side_close,
                 type="MARKET",
-                closePosition=True
+                quantity=qty_close,
+                reduceOnly=True
             )
-            print(f"✅ Ordem STOP BUY executada → {order}")
-            return jsonify({"status": "ok"})
 
-        # STOP DE VENDA → fecha posição SELL
-        if action == "stop_sell":
-            print("🔻 Fechando posição de VENDA com closePosition=True")
-            order = client.new_order(
-                symbol=symbol,
-                side="BUY",
-                type="MARKET",
-                closePosition=True
-            )
-            print(f"✅ Ordem STOP SELL executada → {order}")
-            return jsonify({"status": "ok"})
+            print(f"✅ Ordem de STOP executada → {order}")
+            return jsonify({"status": "ok", "closed_qty": qty_close})
 
         # =======================
         # 🚀 ENTRADAS NORMAIS
@@ -98,7 +107,7 @@ def webhook():
             quantity=qty
         )
 
-        print(f"✅ Ordem executada: {side} → {order}")
+        print(f"✅ Ordem de ENTRADA executada: {side} → {order}")
         return jsonify({"status": "ok"})
 
     except Exception as e:
