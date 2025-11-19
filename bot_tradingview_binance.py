@@ -59,7 +59,7 @@ def webhook():
             print("🛑 STOP recebido, tentando fechar posição aberta...")
 
             # Pegamos a posição atual na Binance
-            positions = client.position_risk(symbol=symbol)
+            positions = client.get_position_risk(symbol=symbol)
             print(f"📊 Posições retornadas: {positions}")
 
             pos = None
