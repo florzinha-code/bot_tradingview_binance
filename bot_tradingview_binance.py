@@ -18,6 +18,7 @@ def webhook():
 
         symbol = "BTCUSDT"
         leverage = 2
+        usar_pct = 0.85  # 85% do saldo
 
         # ==========================================
         # 🔧 CONFIG BASE
@@ -29,24 +30,29 @@ def webhook():
 
         client.change_leverage(symbol=symbol, leverage=leverage)
 
-        # 💰 Saldo conta futura
+        # 💰 Saldo
         balance = client.balance()
         usdt_balance = next((float(b['balance']) for b in balance if b['asset'] == 'USDT'), 0.0)
 
         price = float(client.ticker_price(symbol=symbol)['price'])
 
         # ==========================================
-        # 📦 QUANTIDADE DINÂMICA — 70% da banca
+        # 📦 QUANTIDADE DINÂMICA → 85% COM 2X
         # ==========================================
-        qty = (usdt_balance * 0.70 / price)
-        qty = math.floor(qty * 1000) / 1000    # arredonda
+        position_value = usdt_balance * usar_pct * leverage  # valor em USDT da posição
+        qty = position_value / price
 
-        # 📍 Garante mínimo para novas posições
-        min_qty = 100 / price                 # mínimo ≈ US$100
+        # Arredonda para 4 casas
+        qty = math.floor(qty * 10000) / 10000
+
+        # 🔒 mínimo para ordem (~$100)
+        min_qty = 100 / price
         if qty < min_qty:
             qty = min_qty
 
-        print(f"📦 Quantidade calculada: {qty} BTC")
+        print(f"💰 Saldo USDT: {usdt_balance}")
+        print(f"🔗 Exposição: {position_value} USDT (2x sobre 85%)")
+        print(f"📦 Quantidade final enviada: {qty} BTC")
 
         # ==========================================
         # 🛑 STOP (FECHA QUALQUER POSIÇÃO)
