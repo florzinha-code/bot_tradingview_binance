@@ -4,7 +4,6 @@ import json, os, math
 
 app = Flask(__name__)
 
-# 🔑 Chaves da Binance (Render Environment)
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 
@@ -12,70 +11,94 @@ client = UMFutures(key=API_KEY, secret=API_SECRET)
 
 @app.route('/', methods=['POST'])
 def webhook():
-   try:
-       data = json.loads(request.data)
-       action = data.get('action')
-       print(f"🚨 ALERTA RECEBIDO: {action}")
+    try:
+        data = json.loads(request.data)
+        action = data.get('action')
+        print(f"🚨 ALERTA RECEBIDO: {action}")
 
-       # 💰 Consulta saldo
-       balance = client.balance()
-       usdt_balance = next(
-           (float(b['balance']) for b in balance if b['asset'] == 'USDT'),
-           0.0
-       )
-       print(f"💰 Saldo FUTUROS USDT-M detectado: {usdt_balance:.3f} USDT")
+        symbol = "BTCUSDT"
+        leverage = 2
 
-       if usdt_balance <= 5:
-           return jsonify({"status": "❌ Saldo insuficiente"}), 400
+        # ==========================================
+        # 🔧 DEFINIR MODO E ALAVANCAGEM
+        # ==========================================
+        try:
+            client.change_margin_type(symbol=symbol, marginType="CROSSED")
+        except Exception:
+            pass
 
-       symbol = "BTCUSDT"
-       leverage = 1
-       margin_type = "CROSSED"  # <-- modo Cross
+        client.change_leverage(symbol=symbol, leverage=leverage)
 
-       # 🔧 Define modo de margem e alavancagem
-       try:
-           client.change_margin_type(symbol=symbol, marginType=margin_type)
-           print("✅ Modo de margem definido como CROSS")
-       except Exception as e:
-           if "No need to change margin type" in str(e):
-               print("ℹ️ Margem já está CROSS.")
-           else:
-               print("⚠️ Erro ao mudar margem:", e)
+        # ==========================================
+        # 💰 PEGA SALDO E CALCULA QTD DINÂMICA
+        # ==========================================
+        balance = client.balance()
+        usdt_balance = next((float(b['balance']) for b in balance if b['asset'] == 'USDT'), 0.0)
 
-       client.change_leverage(symbol=symbol, leverage=leverage)
-       print(f"⚙️ Alavancagem definida: {leverage}x")
+        price = float(client.ticker_price(symbol=symbol)['price'])
+        qty = math.floor((usdt_balance * 0.85 / price) * 1000) / 1000
 
-       # 📈 Preço atual
-       price = float(client.ticker_price(symbol=symbol)['price'])
-       print(f"💹 Preço atual BTCUSDT: {price}")
+        if qty < 0.001:
+            qty = 0.001
 
-       # 📦 Calcula quantidade — 85% do saldo / preço (sempre arredonda para baixo)
-       qty = math.floor((usdt_balance * 0.85 / price) * 1000) / 1000
+        print(f"💹 Preço BTCUSDT: {price}")
+        print(f"💰 Saldo: {usdt_balance} USDT")
+        print(f"📦 Quantidade calculada: {qty} BTC")
 
-       # Garante mínimo aceito pela Binance
-       if qty < 0.001:
-           qty = 0.001
+        # ==========================================
+        # 🛑 STOP → FECHA QUALQUER POSIÇÃO ABERTA
+        # ==========================================
+        if action in ("stop_buy", "stop_sell", "stop"):
+            print("🔍 Consultando posição aberta...")
+            positions = client.get_position_risk()
+            pos = next((p for p in positions if p["symbol"] == symbol and float(p["positionAmt"]) != 0), None)
 
-       print(f"📦 Quantidade final enviada: {qty} BTC")
+            if not pos:
+                print("ℹ️ Nenhuma posição aberta para fechar.")
+                return jsonify({"status": "ok", "info": "sem_posicao"})
 
-       # 🚀 Define lado da ordem com suporte aos 4 tipos de ação
-       if action in ('buy', 'stop_sell'):
-           side = "BUY"
-       elif action in ('sell', 'stop_buy'):
-           side = "SELL"
-       else:
-           print("❌ Ação inválida:", action)
-           return jsonify({"status": "❌ Ação inválida"}), 400
+            position_amt = float(pos["positionAmt"])
+            qty_close = abs(position_amt)
+            side_close = "SELL" if position_amt > 0 else "BUY"
 
-       # 🚀 Executa ordem
-       order = client.new_order(symbol=symbol, side=side, type="MARKET", quantity=qty)
-       print(f"✅ Ordem executada: {side}", order)
-       return jsonify({"status": f"✅ {side} executado", "qty": qty})
+            print(f"🔒 Fechando {qty_close} BTC → lado {side_close}")
 
-   except Exception as e:
-       print("❌ Erro geral:", e)
-       return jsonify({"error": str(e)}), 500
+            order = client.new_order(
+                symbol=symbol,
+                side=side_close,
+                type="MARKET",
+                quantity=qty_close
+            )
+
+            print(f"✅ POSIÇÃO FECHADA → {order}")
+            return jsonify({"status": "ok", "closed": qty_close})
+
+        # ==========================================
+        # 🚀 ENTRADAS
+        # ==========================================
+        if action == "buy":
+            side = "BUY"
+        elif action == "sell":
+            side = "SELL"
+        else:
+            return jsonify({"status": "❌ ação inválida"}), 400
+
+        print(f"📌 ENTRADA → {side} {qty} BTC")
+
+        order = client.new_order(
+            symbol=symbol,
+            side=side,
+            type="MARKET",
+            quantity=qty
+        )
+
+        print(f"✅ ENTRADA EXECUTADA → {order}")
+        return jsonify({"status": "ok", "side": side})
+
+    except Exception as e:
+        print("❌ ERRO GERAL:", e)
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == '__main__':
-   app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000)
