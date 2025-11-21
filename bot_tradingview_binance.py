@@ -36,9 +36,9 @@ def webhook():
         price = float(client.ticker_price(symbol=symbol)['price'])
 
         # ==========================================
-        # 📦 QUANTIDADE DINÂMICA — 85% da banca
+        # 📦 QUANTIDADE DINÂMICA — 70% da banca
         # ==========================================
-        qty = (usdt_balance * 0.85 / price)
+        qty = (usdt_balance * 0.70 / price)
         qty = math.floor(qty * 1000) / 1000    # arredonda
 
         # 📍 Garante mínimo para novas posições
